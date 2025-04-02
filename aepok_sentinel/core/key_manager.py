@@ -182,35 +182,53 @@ class KeyManager:
         return keys
 
     def _fetch_cloud_keys(self) -> Dict[str, bytes]:
-        """
-        Minimal approach to demonstrate a 'cloud fetch'.
-        If scif/airgap => raise error. 
-        If strict_transport => we must pretend we have a PQC handshake or fail.
-        For demonstration, we do a simple GET to config.cloud_keyvault_url + "/current_keys"
-        and expect a JSON with base64 fields:
-          {
-            "kyber_priv": "...",
-            "dilithium_priv": "...",
-            "rsa_priv": "..." (optional)
-          }
-        If fail => raise KeyManagerError.
-        """
         if self.config.mode in ("scif", "airgap"):
             raise KeyManagerError("No network allowed in SCIF or airgap mode.")
 
         if not self.config.cloud_keyvault_url:
             raise KeyManagerError("cloud_keyvault_url is empty or not set.")
 
-        # If config.strict_transport => we simulate a check that server can do PQC or we fail
-        # We'll do a naive approach: if there's "strict_transport" => we won't allow normal TLS
-        # In a real system, we'd do a PQC TLS handshake. We'll just do a normal requests GET as a placeholder.
-        # "No placeholders"? We do an actual requests call, acknowledging that PQC enforcement is partial here.
+        # Use PQC TLS to securely fetch keys from the cloud key vault.
+        from urllib.parse import urlparse
+        from aepok_sentinel.core.pqc_tls import connect_pqc_socket
+
+        parsed = urlparse(self.config.cloud_keyvault_url)
+        hostname = parsed.hostname
+        port = parsed.port if parsed.port else 443
+        path = "/current_keys"
+
         try:
-            resp = requests.get(self.config.cloud_keyvault_url + "/current_keys", timeout=10)
-            if resp.status_code != 200:
-                raise KeyManagerError(f"Cloud fetch returned HTTP {resp.status_code}")
-            data = resp.json()
-            # Expect base64 fields
+            # Establish a TLS connection using PQC enforcement.
+            tls_sock = connect_pqc_socket(self.config, hostname, port)
+
+            # Build and send the HTTP GET request.
+            request_str = f"GET {path} HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n"
+            tls_sock.sendall(request_str.encode("utf-8"))
+
+            # Read the full response from the socket.
+            response = b""
+            while True:
+                chunk = tls_sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            tls_sock.close()
+
+            # Separate HTTP headers from the body.
+            header_end = response.find(b"\r\n\r\n")
+            if header_end == -1:
+                raise KeyManagerError("Invalid HTTP response from cloud keyvault")
+            headers = response[:header_end].decode("utf-8")
+            body = response[header_end + 4:]
+
+            # Verify a 200 OK status in the response header.
+            if "200 OK" not in headers:
+                first_line = headers.splitlines()[0] if headers.splitlines() else "Unknown status"
+                raise KeyManagerError(f"Cloud fetch returned non-200 status: {first_line}")
+
+            # Parse the JSON body.
+            import json
+            data = json.loads(body.decode("utf-8"))
             kyber_b64 = data.get("kyber_priv")
             dil_b64 = data.get("dilithium_priv")
             if not kyber_b64 or not dil_b64:
