@@ -25,18 +25,18 @@ Aepok Sentinel is a cross-platform, zero-trust file protection system that provi
 This project is developed under a “final shape” doctrine: every module is immutable once built, all compatibility is proven, not promised, and the system is legally defined by this specification.
 
 ## Quickstart
-### For normal systems with internet access:
+**For normal systems with internet access:**
 ```bash
 pip install aepok-sentinel
 ```
-### For SCIF or airgap systems, place locally built wheels in a `./wheels` directory:
+**For SCIF or airgap systems, place locally built wheels in a `./wheels` directory:**
 ```bash
 pip install --no-index --find-links ./wheels aepok-sentinel
 ```
 
 Then:
 
-### Activate the system with a valid license
+**Activate the system with a valid license**
 ```bash
 sentinel --activate
 ```
@@ -210,7 +210,7 @@ These bundles include:
   - Optional `.sig` GPG or `Dilithium` signature file
   - Chain-compatible for audit record initialization
 
---
+---
 
 **To install Sentinel in a secure offline deployment:**
 
@@ -237,7 +237,7 @@ This process guarantees full compliance with:
 
 - **Zero Trust offline asset handling**
 
---
+---
 
 **Important:**
 No Sentinel installation is valid until `verify_install.py` completes successfully and logs are written to the audit chain. All deployments in `scif` or `airgap` mode are considered **sealed systems**—updates must go through the **Patch Lifecycle** and be cryptographically validated before execution.
