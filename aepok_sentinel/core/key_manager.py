@@ -48,7 +48,7 @@ class KeyManager:
     def __init__(self, config: SentinelConfig, license_mgr: LicenseManager):
         self.config = config
         self.license_mgr = license_mgr
-        self.local_key_dir = "/etc/sentinel/keys"  # fixed per doc
+        self.local_key_dir = config.raw_dict.get("key_storage_path", "/etc/sentinel/keys")  # fixed per doc
         # we can store e.g. kyber_priv_{timestamp}.bin, dilithium_priv_{timestamp}.bin, etc.
 
         # How many old generations to keep
