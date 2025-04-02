@@ -15,6 +15,7 @@ import os
 import json
 from typing import Optional, Any, Dict, List
 from aepok_sentinel.core.logging_setup import get_logger
+from utils.sentinelrc_schema import validate_sentinelrc
 
 logger = get_logger("config")
 
@@ -153,14 +154,11 @@ def load_config(file_path: str,
         raise ConfigError(f"Config file '{file_path}' not found.")
 
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            raw_data = json.load(f)
-    except json.JSONDecodeError as e:
-        raise ConfigError(f"Invalid JSON in config file '{file_path}': {e}")
+        validated_data = validate_sentinelrc(raw_data)
     except Exception as e:
-        raise ConfigError(f"Failed to read config file '{file_path}': {e}")
+        raise ConfigError(f"Schema validation failed: {e}")
 
-    config_obj = SentinelConfig(raw_data)
+    config_obj = SentinelConfig(validated_data)
 
     # Apply environment override if parse_env is True
     if parse_env:
