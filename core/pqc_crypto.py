@@ -21,8 +21,8 @@ import json
 import logging
 from typing import Optional, Dict, Any, Tuple
 
-from aepok_sentinel.core.logging_setup import get_logger
-from aepok_sentinel.core.config import SentinelConfig
+from logging_setup import get_logger
+from config import SentinelConfig
 
 logger = get_logger("pqc_crypto")
 
