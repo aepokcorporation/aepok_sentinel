@@ -19,6 +19,7 @@ from utils.sentinelrc_schema import validate_sentinelrc
 
 logger = get_logger("config")
 
+
 class ConfigError(Exception):
     """Raised when .sentinelrc is invalid or missing required fields."""
     pass
@@ -26,7 +27,7 @@ class ConfigError(Exception):
 
 class SentinelConfig:
     """
-    A container for all parsed .sentinelrc fields.
+    A container for all parsed .sentinelrc fields, plus enforcement_mode logic.
     """
 
     def __init__(self, raw_dict: Dict[str, Any]):
@@ -36,6 +37,10 @@ class SentinelConfig:
         # Required fields
         self.schema_version: int = raw_dict["schema_version"]
         self.mode: str = raw_dict["mode"]
+
+        # New field for audit fix [4], [79]:
+        # If not set, default to "PERMISSIVE"; we can override for scif/airgap below.
+        self.enforcement_mode: str = raw_dict.get("enforcement_mode", "PERMISSIVE")
 
         # Optional fields (with defaults from instruction manual)
         self.allow_delete: bool = raw_dict.get("allow_delete", False)
@@ -54,9 +59,9 @@ class SentinelConfig:
         self.encryption_enabled: bool = raw_dict.get("encryption_enabled", True)
         self.decryption_enabled: bool = raw_dict.get("decryption_enabled", True)
         self.decryption_requires_chain: bool = raw_dict.get("decryption_requires_chain", True)
-        # (chain_verification_on_decrypt is a synonym, possibly unify in the future)
         self.chain_verification_on_decrypt: bool = raw_dict.get(
-            "chain_verification_on_decrypt", self.decryption_requires_chain
+            "chain_verification_on_decrypt",
+            self.decryption_requires_chain
         )
         self.quarantine_enabled: bool = raw_dict.get("quarantine_enabled", True)
         self.quarantine_retains_original: bool = raw_dict.get("quarantine_retains_original", True)
@@ -68,7 +73,7 @@ class SentinelConfig:
         self.bound_to_hardware: bool = raw_dict.get("bound_to_hardware", False)
         self.license_type: str = raw_dict.get("license_type", "individual")
 
-        # Additional advanced fields from clarifications
+        # Additional advanced fields
         self.use_cbc_hmac: bool = raw_dict.get("use_cbc_hmac", False)
         self.allow_classical_fallback: bool = raw_dict.get("allow_classical_fallback", True)
         self.cloud_keyvault_enabled: bool = raw_dict.get("cloud_keyvault_enabled", False)
@@ -77,13 +82,16 @@ class SentinelConfig:
         self.max_concurrent_workers: int = raw_dict.get("max_concurrent_workers", 4)
         self.use_inotify: bool = raw_dict.get("use_inotify", True)
 
-        # allow_unknown_keys logic
+        # Allow or disallow unknown keys
         self.allow_unknown_keys: bool = raw_dict.get("allow_unknown_keys", False)
 
+        # Basic validations
         self._validate_schema_version()
         self._validate_mode()
         self._check_for_unknown_keys()
         self._apply_scif_airgap_overrides_if_needed()
+        self._validate_enforcement_mode()
+        self._validate_coherence()
 
     def _validate_schema_version(self) -> None:
         if not isinstance(self.schema_version, int) or self.schema_version < 1:
@@ -93,6 +101,39 @@ class SentinelConfig:
         valid_modes = ["airgap", "scif", "cloud", "demo", "watch-only"]
         if self.mode not in valid_modes:
             raise ConfigError(f"Invalid mode '{self.mode}'. Must be one of {valid_modes}")
+
+    def _validate_enforcement_mode(self) -> None:
+        """
+        For scif => must be STRICT
+        For airgap => default to HARDENED if not specified
+        Otherwise, must be one of STRICT/HARDENED/PERMISSIVE
+        """
+        # If scif => force STRICT
+        if self.mode == "scif":
+            self.enforcement_mode = "STRICT"
+
+        # If airgap => default to HARDENED if user didn't explicitly set
+        elif self.mode == "airgap":
+            if "enforcement_mode" not in self.raw_dict:
+                self.enforcement_mode = "HARDENED"
+
+        valid_enforce = ("STRICT", "HARDENED", "PERMISSIVE")
+        if self.enforcement_mode not in valid_enforce:
+            raise ConfigError(
+                f"Invalid enforcement_mode '{self.enforcement_mode}'. "
+                f"Must be one of {valid_enforce}."
+            )
+
+        # If the sentinelrc signature was invalid, validate_sentinelrc() would raise an error
+        # but if it was "invalid but we returned anyway", we treat that as a fail unless "PERMISSIVE".
+        # We can't do a real signature check here—no forward references—so we rely on validate_sentinelrc.
+        # If validate_sentinelrc sets something like raw_dict["_signature_verified"] = False, do:
+        if (self.raw_dict.get("_signature_verified") is False
+                and self.enforcement_mode != "PERMISSIVE"):
+            raise ConfigError(
+                "Signature verification failed for .sentinelrc, "
+                f"and enforcement_mode={self.enforcement_mode} does not allow fallback."
+            )
 
     def _check_for_unknown_keys(self) -> None:
         """
@@ -108,7 +149,8 @@ class SentinelConfig:
             "manual_override_allowed", "demo_behavior", "pre_scan_hook", "strict_transport",
             "license_required", "bound_to_hardware", "license_type", "use_cbc_hmac", "allow_classical_fallback",
             "cloud_keyvault_enabled", "cloud_keyvault_provider", "manual_key_entry_enabled",
-            "max_concurrent_workers", "use_inotify", "allow_unknown_keys"
+            "max_concurrent_workers", "use_inotify", "allow_unknown_keys", "enforcement_mode",
+            "_signature_verified"  # might be inserted by validate_sentinelrc
         }
         for key in self.raw_dict.keys():
             if key not in known_keys and not self.allow_unknown_keys:
@@ -117,30 +159,28 @@ class SentinelConfig:
     def _apply_scif_airgap_overrides_if_needed(self) -> None:
         # If mode is scif or airgap => forcibly set no network calls, console off, etc.
         if self.mode == "scif":
-            # SCIF implies no external calls
-            # Also forcibly set manual_override_allowed = false
-            # decryption_requires_chain = true
-            # console logs forcibly off. We'll rely on the daemon or init_logging step
-            # to interpret that. But we set manual_override_allowed to false here.
             self.cloud_keyvault_url = ""
             self.cloud_keyvault_enabled = False
             self.manual_override_allowed = False
             self.decryption_requires_chain = True
             self.chain_verification_on_decrypt = True
 
-        if self.mode == "airgap":
-            # No network calls, no cloud keyvault usage allowed
+        elif self.mode == "airgap":
             self.cloud_keyvault_url = ""
             self.cloud_keyvault_enabled = False
-            # The doc doesn't forcibly set manual_override_allowed = false for airgap,
-            # only scif. So we leave it as is.
             self.decryption_requires_chain = True
             self.chain_verification_on_decrypt = True
-        # If cloud => no special override needed here besides what we do in step 3 or later.
+
+    def _validate_coherence(self) -> None:
+        """
+        Catch contradictory settings, e.g. strict_transport=True but allow_classical_fallback=True.
+        """
+        if self.strict_transport and self.allow_classical_fallback:
+            # It's contradictory to enforce PQC/TLS strictly but also allow classical RSA fallback
+            raise ConfigError("Incoherent config: strict_transport=True but allow_classical_fallback=True.")
 
 
-def load_config(file_path: str,
-                parse_env: bool = True) -> SentinelConfig:
+def load_config(file_path: str, parse_env: bool = True) -> SentinelConfig:
     """
     Loads .sentinelrc from file_path, parses and returns a SentinelConfig object.
     If parse_env=True, environment variables like SENTINEL_MODE override the config's mode.
@@ -154,22 +194,43 @@ def load_config(file_path: str,
         raise ConfigError(f"Config file '{file_path}' not found.")
 
     try:
-        validated_data = validate_sentinelrc(raw_data)
+        with open(file_path, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+    except Exception as e:
+        raise ConfigError(f"Unable to load JSON from '{file_path}': {e}")
+
+    # Validate the sentinelrc structure (including optional signature check).
+    # If there's a signature mismatch and enforcement_mode != "PERMISSIVE", we raise inside SentinelConfig.
+    try:
+        validated_data = validate_sentinelrc(raw_data)  # must return dict, may add "_signature_verified"
     except Exception as e:
         raise ConfigError(f"Schema validation failed: {e}")
 
     config_obj = SentinelConfig(validated_data)
 
-    # Apply environment override if parse_env is True
+    # If parse_env=True, we apply a small whitelist of environment overrides.
     if parse_env:
-        env_mode = os.environ.get("SENTINEL_MODE")
-        if env_mode:
-            if env_mode != config_obj.mode:
-                logger.warning(f"Environment overrides mode: {config_obj.mode} -> {env_mode}")
-                config_obj.mode = env_mode
-                config_obj._validate_mode()
-                # If we just changed mode to scif or airgap, apply scif/airgap overrides
-                if env_mode in ("scif", "airgap"):
+        # At present, only SENTINEL_MODE is allowed.
+        env_allowed = ["SENTINEL_MODE"]  # expand if needed
+        for env_var in env_allowed:
+            val = os.environ.get(env_var)
+            if val is not None and env_var == "SENTINEL_MODE":
+                if val != config_obj.mode:
+                    logger.warning(f"Environment overrides mode: {config_obj.mode} -> {val}")
+                    config_obj.mode = val
+                    config_obj._validate_mode()
+                    # Reapply scif/airgap overrides if we forcibly changed mode
                     config_obj._apply_scif_airgap_overrides_if_needed()
+                    config_obj._validate_enforcement_mode()
+                    config_obj._validate_coherence()
+
+    # [2] Log a line so we can track config loads in the audit chain later
+    logger.info(
+        "CONFIG_LOADED: file=%s, mode=%s, enforcement_mode=%s, schema_version=%d",
+        file_path,
+        config_obj.mode,
+        config_obj.enforcement_mode,
+        config_obj.schema_version
+    )
 
     return config_obj
