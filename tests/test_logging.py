@@ -3,8 +3,9 @@ Unit tests for aepok_sentinel/core/logging_setup.py
 
 Covers:
 - Basic JSON logging
-- Log rotation
+- Log rotation (including verification of "LOG_ROTATED" entry)
 - SCIF console suppression
+- Invalid log path handling
 """
 
 import os
@@ -51,7 +52,6 @@ class TestLoggingSetup(unittest.TestCase):
         logger = get_logger("test_subsystem")
         logger.info("Hello from test_logging")
 
-        # read the log
         logfile = os.path.join(self.temp_dir, "sentinel.log")
         with open(logfile, "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -70,26 +70,43 @@ class TestLoggingSetup(unittest.TestCase):
     def test_rotation(self):
         """
         Write logs until rotation triggers, ensure multiple files exist.
+        Also verify that a 'LOG_ROTATED' event is recorded in the new log file.
         """
         init_logging(
             log_path=self.temp_dir,
             scif_mode=False,
             manual_override_allowed=False,
             debug_console=False,
-            max_bytes=200,  # small for test
+            max_bytes=200,  # small size to force rotation quickly
             backup_count=2
         )
         logger = get_logger("rotate_test")
+
+        # Write enough lines to exceed 200 bytes at least once
         for i in range(20):
             logger.info(f"Line {i}")
 
-        # This should create sentinel.log and sentinel.log.1 (maybe sentinel.log.2 if needed)
+        # Check the directory for multiple log files (sentinel.log, sentinel.log.1, etc.)
         log_files = os.listdir(self.temp_dir)
-        # Check if we have at least sentinel.log + sentinel.log.1
-        # The RotatingFileHandler only rotates upon next write once size is exceeded,
-        # so we expect at least 2 files, possibly 3 if we exceed again.
         possible_logs = [f for f in log_files if f.startswith("sentinel.log")]
-        self.assertTrue(len(possible_logs) >= 2, "Expected log rotation to produce multiple files")
+        self.assertTrue(
+            len(possible_logs) >= 2,
+            "Expected log rotation to produce multiple files"
+        )
+
+        # Verify 'LOG_ROTATED' event in the current sentinel.log
+        current_logfile = os.path.join(self.temp_dir, "sentinel.log")
+        with open(current_logfile, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        found_log_rotated = any(
+            (json.loads(line).get("event_code") == "LOG_ROTATED")
+            for line in lines
+        )
+        self.assertTrue(
+            found_log_rotated,
+            "Expected a LOG_ROTATED event in the new log file after rotation"
+        )
 
     def test_scif_mode_suppression(self):
         """
@@ -97,7 +114,7 @@ class TestLoggingSetup(unittest.TestCase):
         We'll mock sys.stdout to see if anything is printed.
         """
         # case 1: scif_mode=True, debug_console=False => no console output
-        with patch("sys.stdout", new_callable=lambda: open(os.devnull, "w")) as mock_stdout:
+        with patch("sys.stdout", new_callable=lambda: open(os.devnull, "w")):
             init_logging(
                 log_path=self.temp_dir,
                 scif_mode=True,
@@ -110,8 +127,7 @@ class TestLoggingSetup(unittest.TestCase):
             self.assertIsNone(_CONSOLE_HANDLER)
 
         # case 2: scif_mode=True, debug_console=True but manual_override_allowed=False => still suppressed
-        with patch("sys.stdout", new_callable=lambda: open(os.devnull, "w")) as mock_stdout:
-            # Re-init again
+        with patch("sys.stdout", new_callable=lambda: open(os.devnull, "w")):
             global _LOGGING_INITIALIZED, _FILE_HANDLER, _CONSOLE_HANDLER
             _LOGGING_INITIALIZED = False
             _FILE_HANDLER = None
@@ -128,7 +144,7 @@ class TestLoggingSetup(unittest.TestCase):
             self.assertIsNone(_CONSOLE_HANDLER)
 
         # case 3: scif_mode=True, debug_console=True, manual_override_allowed=True => console enabled
-        with patch("sys.stdout", new_callable=lambda: open(os.devnull, "w")) as mock_stdout:
+        with patch("sys.stdout", new_callable=lambda: open(os.devnull, "w")):
             global _LOGGING_INITIALIZED, _FILE_HANDLER, _CONSOLE_HANDLER
             _LOGGING_INITIALIZED = False
             _FILE_HANDLER = None
