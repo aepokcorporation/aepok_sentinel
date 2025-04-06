@@ -1,17 +1,14 @@
 """
-Step 5.2: Azure Client Transport
+azure_clients.py
 
-Implements a minimal Azure Key Vault client that:
-  - Checks .sentinelrc for cloud mode + azure
-  - For scif/airgap => raises error (no network)
-  - Enforces watch-only => read calls allowed, writes fail
-  - Uses PQC-hybrid TLS from core/pqc_tls if config.strict_transport or config.tls_mode != 'classical'
-  - No placeholders or forward references to step 6+.
+A minimal Azure Key Vault client supporting:
+ - SCIF/airgap disallowed (raises error)
+ - Watch-only => read-only
+ - PQC-hybrid TLS usage if strict_transport or tls_mode != "classical"
+ - Fallback to default TLS if non-strict and PQC context fails
 
-Methods:
-  - get_secret(secret_name) -> str
-  - set_secret(secret_name, value) -> None
-  - delete_secret(secret_name) -> None (if config.allow_delete or in azure, etc.)
+No directory creation, no silent unverified paths.
+No references to ephemeral future code.
 """
 
 import logging
@@ -23,7 +20,7 @@ from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, is_watch_only
 from aepok_sentinel.core.pqc_tls import create_pqc_ssl_context, PQCTlsError
 
-logger = get_logger("azure_client")
+logger = get_logger("azure_clients")
 
 
 class AzureClientError(Exception):
@@ -33,22 +30,22 @@ class AzureClientError(Exception):
 class AzureClient:
     """
     Minimal Azure Key Vault wrapper:
-    - Must be used only if config.mode='cloud' and config.cloud_keyvault_provider='azure'
-    - If scif/airgap => error
-    - If watch-only => read-only
-    - PQC TLS enforced if strict_transport or tls_mode in ('pqc-only', 'hybrid')
+      - Only valid if config.mode='cloud' and config.cloud_keyvault_provider='azure'
+      - SCIF/airgap => error
+      - watch-only => read-only
+      - PQC TLS if strict_transport or tls_mode in ('pqc-only','hybrid'), else default
     """
 
     def __init__(self, config: SentinelConfig, license_mgr: LicenseManager):
         self.config = config
         self.license_mgr = license_mgr
 
-        # Validate we can do azure calls
+        # Disallow network in SCIF/airgap
         if self.config.mode in ("scif", "airgap"):
             raise AzureClientError("No network allowed in SCIF/airgap mode.")
 
         if not (self.config.mode == "cloud" and self.config.cloud_keyvault_provider == "azure"):
-            raise AzureClientError("AzureClient used in non-cloud or non-azure context.")
+            raise AzureClientError("AzureClient used outside of cloud+azure context.")
 
         if not self.config.cloud_keyvault_url:
             raise AzureClientError("cloud_keyvault_url is empty or not set for Azure usage.")
@@ -58,8 +55,7 @@ class AzureClient:
 
     def get_secret(self, secret_name: str) -> str:
         """
-        Retrieves a secret from Azure Key Vault. 
-        If watch-only => read is still allowed.
+        Retrieves a secret (read is allowed even in watch-only).
         """
         url = f"{self.base_url}/secrets/{secret_name}"
         try:
@@ -67,7 +63,6 @@ class AzureClient:
             if resp.status_code != 200:
                 raise AzureClientError(f"GET {url} returned {resp.status_code}: {resp.text}")
             data = resp.json()
-            # Typically Azure returns a JSON with 'value'
             return data.get("value", "")
         except Exception as e:
             raise AzureClientError(f"Failed to get secret '{secret_name}': {e}")
@@ -75,10 +70,10 @@ class AzureClient:
     def set_secret(self, secret_name: str, value: str) -> None:
         """
         Sets/updates a secret in Azure Key Vault.
-        If watch-only => error (no write).
+        Denied if system is watch-only.
         """
         if is_watch_only(self.license_mgr):
-            raise AzureClientError("System is watch-only; cannot set secret in Azure Key Vault.")
+            raise AzureClientError("Watch-only mode => cannot set secrets.")
 
         url = f"{self.base_url}/secrets/{secret_name}"
         try:
@@ -91,14 +86,13 @@ class AzureClient:
 
     def delete_secret(self, secret_name: str) -> None:
         """
-        Deletes a secret in Azure Key Vault (soft-delete).
-        If watch-only => error
-        If allow_delete=false => error
+        Deletes (soft-delete) a secret in Azure Key Vault.
+        Denied if watch-only or allow_delete=false.
         """
         if is_watch_only(self.license_mgr):
-            raise AzureClientError("System is watch-only; cannot delete secret.")
+            raise AzureClientError("Watch-only => cannot delete secrets.")
         if not self.config.allow_delete:
-            raise AzureClientError("Deletion not allowed by config (allow_delete=false).")
+            raise AzureClientError("Deletion not allowed (allow_delete=false).")
 
         url = f"{self.base_url}/secrets/{secret_name}"
         try:
@@ -111,24 +105,26 @@ class AzureClient:
 
     def _build_requests_session(self) -> requests.Session:
         """
-        Creates a requests Session with a custom SSLContext from pqc_tls (if not classical).
+        Creates a requests Session. 
+        If config.tls_mode != 'classical' or strict_transport => attempt PQC context.
+        If strict => error if PQC context fails, else fallback to default.
         """
         sess = requests.Session()
+
+        # If classical + not strict => normal TLS
         if self.config.tls_mode == "classical" and not self.config.strict_transport:
-            # Just use default
             return sess
 
+        # Attempt PQC
         try:
             ssl_ctx = create_pqc_ssl_context(self.config)
         except PQCTlsError as e:
-            # If strict transport => we can't proceed
             if self.config.strict_transport:
-                raise AzureClientError(f"Strict transport enforced but PQC context failed: {e}")
-            # otherwise, fallback to default
-            logger.warning("PQC context failed, falling back to default TLS: %s", e)
+                raise AzureClientError(f"Strict transport => PQC context failed: {e}")
+            logger.warning("PQC context failed, fallback to default TLS: %s", e)
             return sess
 
-        # attach a custom adapter that uses ssl_ctx
+        # Attach an adapter with custom ssl_ctx
         from requests.adapters import HTTPAdapter
         from urllib3.poolmanager import PoolManager
 
@@ -144,13 +140,11 @@ class AzureClient:
                 return pool
 
         adapter = HTTPAdapter()
-        # Patch its poolmanager
         adapter.init_poolmanager = lambda connections, maxsize, block=None, **kw: PQCPoolManager(
             ssl_context=ssl_ctx,
             num_pools=connections,
             maxsize=maxsize,
-            block=block,
-            strict=True,  # pass anything else needed
+            block=block
         )
         sess.mount("https://", adapter)
         return sess
