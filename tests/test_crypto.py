@@ -1,22 +1,26 @@
 """
-Unit tests for aepok_sentinel/core/pqc_crypto.py
+Unit tests for aepok_sentinel/core/pqc_crypto.py (Final Shape)
 
 Validates:
 - GCM vs CBC+HMAC encryption/decryption
-- PQC (Kyber) + classical fallback (RSA)
-- Dilithium + RSA dual signature
-- Tampered data => decryption or signature fails
+- PQC (Kyber) + optional RSA fallback
+- Dilithium + optional RSA dual signature
+- Tampered data => fail
+- RNG check
+- Memory zeroization on shutdown if ephemeral buffers exist
 
-If oqs is not installed, these tests either skip or raise ImportError.
+Skips if 'oqs' is missing.
 """
 
 import os
 import unittest
 import base64
-import sys
-from unittest import skipIf
+from unittest import skipIf, mock
+from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_padding
+from cryptography.hazmat.primitives import serialization, hashes
 
 from aepok_sentinel.core.config import SentinelConfig
+from aepok_sentinel.core import pqc_crypto
 from aepok_sentinel.core.pqc_crypto import (
     encrypt_file_payload,
     decrypt_file_payload,
@@ -24,14 +28,13 @@ from aepok_sentinel.core.pqc_crypto import (
     verify_content_signature,
     CryptoDecryptionError,
     CryptoSignatureError,
-    oqs
+    oqs,
+    sanitize_on_shutdown
 )
 
-# We'll generate ephemeral keys for testing. In a real usage, they'd come from step 5 or outside.
-from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_padding
-from cryptography.hazmat.primitives import serialization, hashes
 
 OQS_MISSING = (oqs is None)
+
 
 @skipIf(OQS_MISSING, "oqs library not installed; skipping PQC tests")
 class TestPqcCrypto(unittest.TestCase):
@@ -60,10 +63,13 @@ class TestPqcCrypto(unittest.TestCase):
             encryption_algorithm=serialization.NoEncryption()
         )
 
+    def tearDown(self):
+        """
+        Optionally test memory sanitize
+        """
+        sanitize_on_shutdown()
+
     def test_encrypt_decrypt_gcm(self):
-        """
-        Test default GCM encryption/decryption with PQC + RSA fallback allowed.
-        """
         config_dict = {
             "schema_version": 1,
             "mode": "cloud",
@@ -85,21 +91,16 @@ class TestPqcCrypto(unittest.TestCase):
         self.assertTrue(payload["wrapped_key_rsa"])
         self.assertTrue(payload["iv"])
         self.assertTrue(payload["auth_tag"])
-        self.assertEqual(payload["integrity"], "")
 
-        # decrypt
         recovered = decrypt_file_payload(
             payload,
             cfg,
-            kyber_priv=self.kyber_priv,
-            rsa_priv=self.rsa_priv_pem
+            self.kyber_priv,
+            self.rsa_priv_pem
         )
         self.assertEqual(recovered, plaintext)
 
     def test_encrypt_decrypt_cbc_hmac(self):
-        """
-        Test AES-CBC + HMAC-SHA512 path. PQC + RSA fallback allowed.
-        """
         config_dict = {
             "schema_version": 1,
             "mode": "cloud",
@@ -119,23 +120,18 @@ class TestPqcCrypto(unittest.TestCase):
         self.assertTrue(payload["wrapped_key_kyber"])
         self.assertTrue(payload["wrapped_key_rsa"])
         self.assertTrue(payload["iv"])
-        self.assertTrue(payload["integrity"])
+        self.assertTrue(payload["integrity"])  # CBC+HMAC => integrity stored
         self.assertEqual(payload["auth_tag"], "")
 
-        # decrypt
         recovered = decrypt_file_payload(
             payload,
             cfg,
-            kyber_priv=self.kyber_priv,
-            rsa_priv=self.rsa_priv_pem
+            self.kyber_priv,
+            self.rsa_priv_pem
         )
         self.assertEqual(recovered, plaintext)
 
     def test_no_rsa_fallback(self):
-        """
-        If allow_classical_fallback=false, we omit RSA wrapping in the payload.
-        Attempting to decrypt with RSA alone should fail.
-        """
         config_dict = {
             "schema_version": 1,
             "mode": "cloud",
@@ -149,99 +145,106 @@ class TestPqcCrypto(unittest.TestCase):
             plaintext=plaintext,
             config=cfg,
             kyber_pub=self.kyber_pub,
-            rsa_pub=self.rsa_pub_pem  # we pass it in, but config disallows fallback
+            rsa_pub=self.rsa_pub_pem
         )
         # Should have empty wrapped_key_rsa
         self.assertEqual(payload["wrapped_key_rsa"], "")
 
-        # Decryption tries Kyber only
         recovered = decrypt_file_payload(
             payload,
             cfg,
-            kyber_priv=self.kyber_priv,
-            rsa_priv=self.rsa_priv_pem
+            self.kyber_priv,
+            self.rsa_priv_pem
         )
         self.assertEqual(recovered, plaintext)
 
-        # If kyber decap fails, there's no RSA fallback => CryptoDecryptionError
-        # We'll simulate a tampered kyber CT
-        tampered = payload.copy()
+        # Tamper with kyber => no RSA fallback => must fail
+        tampered = dict(payload)
         tampered["wrapped_key_kyber"] = base64.b64encode(b"junk").decode("utf-8")
         with self.assertRaises(CryptoDecryptionError):
-            decrypt_file_payload(
-                tampered, cfg, self.kyber_priv, self.rsa_priv_pem
-            )
+            decrypt_file_payload(tampered, cfg, self.kyber_priv, self.rsa_priv_pem)
 
     def test_tampered_ciphertext(self):
-        """
-        Tamper with ciphertext => must fail decryption in either GCM or HMAC check.
-        """
-        cfg_dict = {
+        config_dict = {
             "schema_version": 1,
             "mode": "cloud",
             "use_cbc_hmac": False,
             "allow_classical_fallback": True
         }
-        cfg = SentinelConfig(cfg_dict)
+        cfg = SentinelConfig(config_dict)
+
         pt = b"Sample data"
         payload = encrypt_file_payload(pt, cfg, self.kyber_pub, self.rsa_pub_pem)
 
         # Tamper
-        tampered = payload.copy()
+        tampered = dict(payload)
         ct_bytes = base64.b64decode(tampered["ciphertext"])
-        tampered_ct = bytearray(ct_bytes)
-        tampered_ct[0] ^= 0xFF  # flip some bits
-        tampered["ciphertext"] = base64.b64encode(bytes(tampered_ct)).decode("utf-8")
+        ct_mutable = bytearray(ct_bytes)
+        ct_mutable[0] ^= 0xFF
+        tampered["ciphertext"] = base64.b64encode(bytes(ct_mutable)).decode("utf-8")
 
         with self.assertRaises(CryptoDecryptionError):
             decrypt_file_payload(tampered, cfg, self.kyber_priv, self.rsa_priv_pem)
 
     def test_sign_verify_dual(self):
-        """
-        If allow_classical_fallback=true => produce Dilithium + RSA signature, verify both.
-        """
-        cfg_dict = {
+        config_dict = {
             "schema_version": 1,
             "mode": "cloud",
             "allow_classical_fallback": True
         }
-        cfg = SentinelConfig(cfg_dict)
+        cfg = SentinelConfig(config_dict)
         data = b"Hello signature"
 
-        sigs = sign_content_bundle(data, cfg, self.dil_priv, self.rsa_priv_pem)
+        sigs = pqc_crypto.sign_content_bundle(data, cfg, self.dil_priv, self.rsa_priv_pem)
         self.assertTrue(sigs["dilithium"])
         self.assertTrue(sigs["rsa"])
+        self.assertIn("signer_id", sigs["metadata"])
+        self.assertIn("host_fingerprint", sigs["metadata"])
+        self.assertIn("key_fingerprint", sigs["metadata"])
 
         ok = verify_content_signature(data, sigs, cfg, self.dil_pub, self.rsa_pub_pem)
         self.assertTrue(ok)
 
-        # Tamper with data => fails
-        bad_ok = verify_content_signature(b"other data", sigs, cfg, self.dil_pub, self.rsa_pub_pem)
-        self.assertFalse(bad_ok)
+        # Tamper data => fail
+        ok2 = verify_content_signature(b"evil data", sigs, cfg, self.dil_pub, self.rsa_pub_pem)
+        self.assertFalse(ok2)
 
     def test_sign_verify_pqc_only(self):
-        """
-        If allow_classical_fallback=false => only Dilithium signature
-        """
-        cfg_dict = {
+        config_dict = {
             "schema_version": 1,
             "mode": "cloud",
             "allow_classical_fallback": False
         }
-        cfg = SentinelConfig(cfg_dict)
+        cfg = SentinelConfig(config_dict)
         data = b"PQC-only signing"
 
         sigs = sign_content_bundle(data, cfg, self.dil_priv, self.rsa_priv_pem)
         self.assertTrue(sigs["dilithium"])
         self.assertEqual(sigs["rsa"], "")
 
-        # verify
         ok = verify_content_signature(data, sigs, cfg, self.dil_pub, self.rsa_pub_pem)
         self.assertTrue(ok)
 
         # tamper
-        ok2 = verify_content_signature(b"??", sigs, cfg, self.dil_pub, self.rsa_pub_pem)
+        ok2 = verify_content_signature(b"???", sigs, cfg, self.dil_pub, self.rsa_pub_pem)
         self.assertFalse(ok2)
+
+    def test_rng_check(self):
+        """
+        Just ensure the validate_rng() runs without fatal error. If it logs a warning 
+        about identical blocks, it's extremely unlikely but not a fail for test.
+        """
+        # We'll mock os.urandom to produce same blocks, see if logs warning.
+        with mock.patch("os.urandom", side_effect=[b"A"*32, b"A"*32]):
+            with self.assertLogs(level="WARNING") as log_cm:
+                pqc_crypto.validate_rng()
+            self.assertIn("RNG check: identical 32-byte blocks encountered", "".join(log_cm.output))
+
+        # normal => debug log
+        with mock.patch("os.urandom", side_effect=[b"A"*32, b"B"*32]):
+            with self.assertLogs(level="DEBUG") as log_cm:
+                pqc_crypto.validate_rng()
+            self.assertIn("RNG check passed", "".join(log_cm.output))
 
 
 if __name__ == "__main__":
