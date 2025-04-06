@@ -1,9 +1,8 @@
 """
 directory_contract.py
 
-Defines and enforces the required directory and file structure for Aepok Sentinel,
-addressing Flaws [75–78] and [77] by ensuring a single, consistent source of truth
-for paths. No runtime code in Sentinel is allowed to create or guess directories.
+Defines and enforces the required directory and file structure for Aepok Sentinel.
+No runtime code in Sentinel is allowed to create or guess directories.
 
 If a required directory or file is missing, this module will raise a RuntimeError
 during validation. This enforces the principle that all paths are pre-deployed and
