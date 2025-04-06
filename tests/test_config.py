@@ -1,184 +1,229 @@
 import os
 import json
-import shutil
-import logging
-import tempfile
 import unittest
+import tempfile
+import shutil
 from unittest.mock import patch, MagicMock
 from pathlib import Path
 
-from aepok_sentinel.core.logging_setup import (
-    init_logging,
-    get_logger,
-    LoggingSetupError,
-    _LOGGING_INITIALIZED,
-    _FILE_HANDLER,
-    _CONSOLE_HANDLER
-)
+from aepok_sentinel.core.config import load_config, ConfigError, SentinelConfig
 
 
-class TestLoggingSetup(unittest.TestCase):
+class TestConfig(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
-        global _LOGGING_INITIALIZED, _FILE_HANDLER, _CONSOLE_HANDLER
-        _LOGGING_INITIALIZED = False
-        _FILE_HANDLER = None
-        _CONSOLE_HANDLER = None
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    @patch("aepok_sentinel.core.logging_setup.resolve_path")
-    @patch("aepok_sentinel.core.logging_setup.audit_chain.append_event")
-    def test_basic_logging(self, mock_append_event, mock_resolve_path):
-        """
-        Validate basic JSON logging with directory_contract and no rollover triggered.
-        """
-        # Mock directory_contract to return our temp logs dir for "logs"
-        logs_path = Path(self.temp_dir)
-        mock_resolve_path.return_value = logs_path
+    def _write_sentinelrc(self, data: dict, filename=".sentinelrc") -> Path:
+        config_path = Path(self.temp_dir) / filename
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        return config_path
 
-        # Ensure logs dir exists
-        os.mkdir(logs_path)
+    @patch("aepok_sentinel.core.config.resolve_path")
+    @patch("aepok_sentinel.core.config.audit_chain.append_event")
+    def test_valid_config(self, mock_append_event, mock_resolve_path):
+        # Create a minimal valid config
+        data = {
+            "schema_version": 1,
+            "mode": "cloud",
+            "rotation_interval_days": 15
+        }
+        file_path = self._write_sentinelrc(data)
+        mock_resolve_path.return_value = file_path
 
-        init_logging(
-            scif_mode=False,
-            manual_override_allowed=False,
-            debug_console=False
-        )
-        logger = get_logger("test_subsystem")
-        logger.info("Hello from test_logging")
+        cfg = load_config(parse_env=False)
 
-        logfile = logs_path / "sentinel.log"
-        with open(logfile, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+        self.assertEqual(cfg.schema_version, 1)
+        self.assertEqual(cfg.mode, "cloud")
+        self.assertEqual(cfg.rotation_interval_days, 15)
+        # default enforcement = PERMISSIVE
+        self.assertEqual(cfg.enforcement_mode, "PERMISSIVE")
+        # Should have appended CONFIG_LOADED to audit chain
+        mock_append_event.assert_called_once()
+        called_args, called_kwargs = mock_append_event.call_args
+        self.assertEqual(called_kwargs["event"], "CONFIG_LOADED")
+        self.assertIn("file", called_kwargs["metadata"])
+        self.assertEqual(called_kwargs["metadata"]["mode"], "cloud")
 
-        self.assertEqual(len(lines), 1, "Expected exactly one log line.")
-        data = json.loads(lines[0])
-        self.assertIn("timestamp", data)
-        self.assertIn("subsystem", data)
-        self.assertIn("event_code", data)
-        self.assertIn("message", data)
-        self.assertEqual(data["schema_version"], 1)
-        self.assertEqual(data["subsystem"], "test_subsystem")
-        self.assertEqual(data["event_code"], "INFO")
-        self.assertEqual(data["message"], "Hello from test_logging")
-
-        # No rollover => no call to append_event
+    @patch("aepok_sentinel.core.config.resolve_path")
+    @patch("aepok_sentinel.core.config.audit_chain.append_event")
+    def test_missing_file(self, mock_append_event, mock_resolve_path):
+        # If .sentinelrc doesn't exist, we fail
+        missing_path = Path(self.temp_dir) / ".sentinelrc"
+        mock_resolve_path.return_value = missing_path  # but we won't create it
+        with self.assertRaises(ConfigError) as ctx:
+            load_config()
+        self.assertIn("not found", str(ctx.exception).lower())
         mock_append_event.assert_not_called()
 
-    @patch("aepok_sentinel.core.logging_setup.resolve_path")
-    @patch("aepok_sentinel.core.logging_setup.audit_chain.append_event")
-    def test_rotation_with_chain_event(self, mock_append_event, mock_resolve_path):
-        """
-        Force rollover and confirm that 'LOG_ROTATED' is appended to the new log file
-        AND appended to the audit chain.
-        """
-        logs_path = Path(self.temp_dir)
-        mock_resolve_path.return_value = logs_path
-        os.mkdir(logs_path)
+    @patch("aepok_sentinel.core.config.resolve_path")
+    @patch("aepok_sentinel.core.config.audit_chain.append_event")
+    def test_invalid_json(self, mock_append_event, mock_resolve_path):
+        bad_file = Path(self.temp_dir) / ".sentinelrc"
+        with open(bad_file, "w", encoding="utf-8") as f:
+            f.write("{ invalid_json")
+        mock_resolve_path.return_value = bad_file
 
-        init_logging(
-            scif_mode=False,
-            manual_override_allowed=False,
-            debug_console=False,
-            max_bytes=200,  # small size to force rotation quickly
-            backup_count=2
-        )
-        logger = get_logger("rotate_test")
+        with self.assertRaises(ConfigError) as ctx:
+            load_config()
+        self.assertIn("unable to load json", str(ctx.exception).lower())
+        mock_append_event.assert_not_called()
 
-        for i in range(20):
-            logger.info(f"Line {i}")
+    @patch("aepok_sentinel.core.config.resolve_path")
+    @patch("aepok_sentinel.core.config.audit_chain.append_event")
+    def test_missing_required_fields(self, mock_append_event, mock_resolve_path):
+        # Missing "mode"
+        data = {"schema_version": 1}
+        config_file = self._write_sentinelrc(data)
+        mock_resolve_path.return_value = config_file
 
-        # Check for multiple log files
-        log_files = os.listdir(logs_path)
-        possible_logs = [f for f in log_files if f.startswith("sentinel.log")]
-        self.assertGreaterEqual(
-            len(possible_logs), 2,
-            "Expected log rotation to produce multiple files."
-        )
+        with self.assertRaises(ConfigError) as ctx:
+            load_config()
+        self.assertIn("mode", str(ctx.exception).lower())
+        mock_append_event.assert_not_called()
 
-        # Verify 'LOG_ROTATED' in the current sentinel.log
-        current_logfile = logs_path / "sentinel.log"
-        with open(current_logfile, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+    @patch("aepok_sentinel.core.config.resolve_path")
+    @patch("aepok_sentinel.core.config.audit_chain.append_event")
+    def test_env_override(self, mock_append_event, mock_resolve_path):
+        data = {"schema_version": 1, "mode": "cloud"}
+        file_path = self._write_sentinelrc(data)
+        mock_resolve_path.return_value = file_path
 
-        found_log_rotated = any(
-            (json.loads(line).get("event_code") == "LOG_ROTATED") for line in lines
-        )
-        self.assertTrue(found_log_rotated, "Expected a LOG_ROTATED event in the new log file.")
+        with patch.dict(os.environ, {"SENTINEL_MODE": "scif"}):
+            cfg = load_config(parse_env=True)
+            # Because not scif at first, we apply override => changes mode to scif => enforcement=STRICT
+            self.assertEqual(cfg.mode, "scif")
+            self.assertEqual(cfg.enforcement_mode, "STRICT")
+        mock_append_event.assert_called_once()
 
-        # Also verify that the audit chain was updated
-        mock_append_event.assert_any_call(
-            event="LOG_ROTATED",
-            metadata={"logfile": str(current_logfile)}
-        )
+    @patch("aepok_sentinel.core.config.resolve_path")
+    @patch("aepok_sentinel.core.config.audit_chain.append_event")
+    def test_env_override_ignored_in_scif_or_strict(self, mock_append_event, mock_resolve_path):
+        # Start with scif => environment overrides are disabled
+        data = {"schema_version": 1, "mode": "scif"}
+        file_path = self._write_sentinelrc(data)
+        mock_resolve_path.return_value = file_path
 
-    @patch("aepok_sentinel.core.logging_setup.resolve_path")
-    def test_missing_logs_directory(self, mock_resolve_path):
-        """
-        If 'logs' directory doesn't exist, raise LoggingSetupError.
-        """
-        mock_resolve_path.return_value = Path(self.temp_dir) / "missing_logs"
+        with patch.dict(os.environ, {"SENTINEL_MODE": "cloud"}):
+            cfg = load_config(parse_env=True)
+            self.assertEqual(cfg.mode, "scif", "Should not override scif with environment.")
+            self.assertEqual(cfg.enforcement_mode, "STRICT")
 
-        with self.assertRaises(LoggingSetupError) as cm:
-            init_logging(
-                scif_mode=False,
-                manual_override_allowed=False,
-                debug_console=False
-            )
-        self.assertIn("Logs directory not found", str(cm.exception))
+        mock_append_event.assert_called_once()
 
-    @patch("aepok_sentinel.core.logging_setup.resolve_path")
-    def test_scif_mode_suppression(self, mock_resolve_path):
-        """
-        In SCIF mode, console logs are off unless debug_console and manual_override_allowed.
-        """
-        logs_path = Path(self.temp_dir)
-        mock_resolve_path.return_value = logs_path
-        os.mkdir(logs_path)
+    @patch("aepok_sentinel.core.config.resolve_path")
+    @patch("aepok_sentinel.core.config.audit_chain.append_event")
+    def test_scif_forces_strict(self, mock_append_event, mock_resolve_path):
+        data = {
+            "schema_version": 1,
+            "mode": "scif",
+            "cloud_keyvault_url": "https://vault.example.com",
+            "manual_override_allowed": True
+        }
+        file_path = self._write_sentinelrc(data)
+        mock_resolve_path.return_value = file_path
 
-        # scif_mode=True, debug_console=False => no console
-        init_logging(
-            scif_mode=True,
-            manual_override_allowed=False,
-            debug_console=False
-        )
-        logger = get_logger("scif_test")
-        logger.info("Testing scif_mode console off")
-        self.assertIsNone(_CONSOLE_HANDLER)
+        cfg = load_config()
+        self.assertEqual(cfg.mode, "scif")
+        self.assertEqual(cfg.enforcement_mode, "STRICT")
+        self.assertFalse(cfg.cloud_keyvault_enabled)
+        self.assertFalse(cfg.manual_override_allowed)
+        self.assertIn("CONFIG_LOADED", str(mock_append_event.call_args))
 
-        # Reset logging
-        global _LOGGING_INITIALIZED, _FILE_HANDLER, _CONSOLE_HANDLER
-        _LOGGING_INITIALIZED = False
-        _FILE_HANDLER = None
-        _CONSOLE_HANDLER = None
+    @patch("aepok_sentinel.core.config.resolve_path")
+    @patch("aepok_sentinel.core.config.audit_chain.append_event")
+    def test_airgap_defaults_hardened(self, mock_append_event, mock_resolve_path):
+        data = {"schema_version": 1, "mode": "airgap"}
+        file_path = self._write_sentinelrc(data)
+        mock_resolve_path.return_value = file_path
 
-        # scif_mode=True, debug_console=True but manual_override_allowed=False => still off
-        init_logging(
-            scif_mode=True,
-            manual_override_allowed=False,
-            debug_console=True
-        )
-        logger = get_logger("scif_test")
-        logger.info("Testing scif_mode console override no-permission")
-        self.assertIsNone(_CONSOLE_HANDLER)
+        cfg = load_config()
+        self.assertEqual(cfg.mode, "airgap")
+        self.assertEqual(cfg.enforcement_mode, "HARDENED")
+        mock_append_event.assert_called_once()
 
-        # Reset logging again
-        _LOGGING_INITIALIZED = False
-        _FILE_HANDLER = None
-        _CONSOLE_HANDLER = None
+    @patch("aepok_sentinel.core.config.resolve_path")
+    @patch("aepok_sentinel.core.config.audit_chain.append_event")
+    def test_incoherent_settings(self, mock_append_event, mock_resolve_path):
+        data = {
+            "schema_version": 1,
+            "mode": "cloud",
+            "strict_transport": True,
+            "allow_classical_fallback": True
+        }
+        fpath = self._write_sentinelrc(data)
+        mock_resolve_path.return_value = fpath
 
-        # scif_mode=True, debug_console=True, manual_override_allowed=True => console on
-        init_logging(
-            scif_mode=True,
-            manual_override_allowed=True,
-            debug_console=True
-        )
-        logger = get_logger("scif_test")
-        logger.info("Testing scif_mode console override allowed")
-        self.assertIsNotNone(_CONSOLE_HANDLER)
+        with self.assertRaises(ConfigError) as ctx:
+            load_config()
+        self.assertIn("incoherent config", str(ctx.exception).lower())
+        mock_append_event.assert_not_called()
+
+    @patch("aepok_sentinel.core.config.resolve_path")
+    @patch("aepok_sentinel.core.config.audit_chain.append_event")
+    def test_signature_verification(self, mock_append_event, mock_resolve_path):
+        # If _signature_verified=False and the mode => scif => STRICT => must fail
+        data = {
+            "schema_version": 1,
+            "mode": "scif",
+            "_signature_verified": False
+        }
+        fpath = self._write_sentinelrc(data)
+        mock_resolve_path.return_value = fpath
+
+        with self.assertRaises(ConfigError) as ctx:
+            load_config()
+        self.assertIn("signature verification failed", str(ctx.exception).lower())
+        mock_append_event.assert_not_called()
+
+        # If _signature_verified=False but mode=cloud => enforcement=PERMISSIVE => allowed
+        data2 = {
+            "schema_version": 1,
+            "mode": "cloud",
+            "_signature_verified": False
+        }
+        fpath2 = self._write_sentinelrc(data2, filename=".sentinelrc.cloud")
+        mock_resolve_path.return_value = fpath2
+
+        cfg2 = load_config()
+        self.assertEqual(cfg2.mode, "cloud")
+        self.assertEqual(cfg2.enforcement_mode, "PERMISSIVE")
+        self.assertTrue(mock_append_event.called)
+
+    @patch("aepok_sentinel.core.config.resolve_path")
+    @patch("aepok_sentinel.core.config.audit_chain.append_event")
+    def test_unknown_keys(self, mock_append_event, mock_resolve_path):
+        data = {
+            "schema_version": 1,
+            "mode": "cloud",
+            "extra_weird_field": "secret"
+        }
+        fpath = self._write_sentinelrc(data)
+        mock_resolve_path.return_value = fpath
+
+        with self.assertRaises(ConfigError) as ctx:
+            load_config()
+        self.assertIn("unknown config key 'extra_weird_field'", str(ctx.exception).lower())
+        mock_append_event.assert_not_called()
+
+        # allow_unknown_keys => no error
+        data2 = {
+            "schema_version": 1,
+            "mode": "cloud",
+            "allow_unknown_keys": True,
+            "extra_weird_field": "secret"
+        }
+        fpath2 = self._write_sentinelrc(data2)
+        mock_resolve_path.return_value = fpath2
+
+        cfg2 = load_config()
+        self.assertEqual(cfg2.mode, "cloud")
+        self.assertTrue(cfg2.allow_unknown_keys)
+        mock_append_event.assert_called_once()
 
 
 if __name__ == "__main__":
