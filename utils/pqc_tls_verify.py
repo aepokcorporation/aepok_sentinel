@@ -47,6 +47,10 @@ def verify_negotiated_pqc(tls_sock: ssl.SSLSocket, config: SentinelConfig) -> bo
     group_name = _get_negotiated_group(tls_sock) or "unknown_group"
     logger.info("verify_negotiated_pqc: group=%s, tls_mode=%s, strict=%s",
                 group_name, config.tls_mode, config.strict_transport)
+    
+    if group_name == "unknown_group" and config.strict_transport:
+        logger.warning("STRICT mode but negotiated group is unknown => reject")
+        return False
 
     mode = config.tls_mode.lower()
     if mode == "classical":
