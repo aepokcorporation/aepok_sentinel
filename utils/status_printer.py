@@ -1,15 +1,16 @@
 """
-Step 5.5: Status Printer
+status_printer.py
 
-Provides:
-  - gather_system_status(config, license_mgr) -> str
-    Returns a multiline string summarizing the current .sentinelrc config
-    and license state (watch-only or valid).
+Provides two functions:
+ - gather_system_status(config, license_mgr) -> str
+   Returns a multiline string summarizing the current .sentinelrc config
+   and license state (watch-only or valid).
 
-  - print_system_status(config, license_mgr) -> None
-    Prints that status to stdout (or logs).
+ - print_system_status(config, license_mgr) -> None
+   Prints the status to stdout and logs it at INFO.
 
-No forward references to step 6 or beyond. Final shape compliance.
+No directory creation or fallback logic here. 
+Fully final-shape compliance: no references to ephemeral placeholders or steps.
 """
 
 import logging
@@ -26,27 +27,20 @@ logger = get_logger("status_printer")
 def gather_system_status(config: SentinelConfig, license_mgr: LicenseManager) -> str:
     """
     Gathers a multiline string summarizing:
-      - mode
-      - scif/airgap constraints
-      - encryption_enabled, strict_transport, etc.
-      - license valid or watch-only
-      - optional key details (like config.cloud_keyvault_url if mode=cloud)
-
-    :return: a plain text status message
+      - config.mode (SCIF/airgap => note network disallowed)
+      - encryption_enabled, strict_transport
+      - license validity or watch-only
+      - if mode=cloud => show cloud_keyvault_url
+      - other relevant config fields
     """
     lines = []
     lines.append("=== Aepok Sentinel System Status ===")
     lines.append(f"Mode: {config.mode}")
     if config.mode in ("scif", "airgap"):
         lines.append(" - Network calls disallowed.")
-    if config.encryption_enabled:
-        lines.append("Encryption: ENABLED")
-    else:
-        lines.append("Encryption: DISABLED")
-    if config.strict_transport:
-        lines.append("strict_transport: TRUE")
-    else:
-        lines.append("strict_transport: FALSE")
+
+    lines.append("Encryption: ENABLED" if config.encryption_enabled else "Encryption: DISABLED")
+    lines.append(f"strict_transport: {'TRUE' if config.strict_transport else 'FALSE'}")
 
     # license state
     if is_license_valid(license_mgr):
@@ -56,7 +50,6 @@ def gather_system_status(config: SentinelConfig, license_mgr: LicenseManager) ->
     else:
         lines.append("License State: UNKNOWN/INVALID")
 
-    # If mode=cloud => show keyvault url if any
     if config.mode == "cloud" and config.cloud_keyvault_url:
         lines.append(f"Cloud KeyVault URL: {config.cloud_keyvault_url}")
 
@@ -72,7 +65,7 @@ def gather_system_status(config: SentinelConfig, license_mgr: LicenseManager) ->
 
 def print_system_status(config: SentinelConfig, license_mgr: LicenseManager) -> None:
     """
-    Prints the status string to stdout. Also logs an INFO with the summary.
+    Prints the system status to stdout and logs an INFO with the summary.
     """
     status_str = gather_system_status(config, license_mgr)
     print(status_str)
