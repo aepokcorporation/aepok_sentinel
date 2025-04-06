@@ -113,6 +113,11 @@ class AzureClient:
 
         # If classical + not strict => normal TLS
         if self.config.tls_mode == "classical" and not self.config.strict_transport:
+            logger.info(
+                "AzureClient: Using classical TLS transport (tls_mode=%s, strict_transport=%s)",
+                self.config.tls_mode,
+                self.config.strict_transport
+            )
             return sess
 
         # Attempt PQC
