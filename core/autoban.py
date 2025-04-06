@@ -369,8 +369,7 @@ class AutobanManager:
         }
 
         if not trusted_binaries:
-            logger.warning("No known 'trusted_binaries' manifest => skipping hash check, NOT secure!")
-            return True
+            raise AutobanError("No trusted firewall binaries defined. Enforcement is not secure.")
 
         # compute hash
         try:
