@@ -1,20 +1,12 @@
-"""
-Unit tests for aepok_sentinel/core/logging_setup.py
-
-Covers:
-- Basic JSON logging
-- Log rotation (including verification of "LOG_ROTATED" entry)
-- SCIF console suppression
-- Invalid log path handling
-"""
-
 import os
+import json
 import shutil
 import logging
-import json
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
+from pathlib import Path
+
 from aepok_sentinel.core.logging_setup import (
     init_logging,
     get_logger,
@@ -29,8 +21,6 @@ class TestLoggingSetup(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
-        # Reset the global flags so each test can re-init logging
-        # (In real usage, we'd only init once, but for test coverage we reset.)
         global _LOGGING_INITIALIZED, _FILE_HANDLER, _CONSOLE_HANDLER
         _LOGGING_INITIALIZED = False
         _FILE_HANDLER = None
@@ -39,12 +29,20 @@ class TestLoggingSetup(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_basic_logging(self):
+    @patch("aepok_sentinel.core.logging_setup.resolve_path")
+    @patch("aepok_sentinel.core.logging_setup.audit_chain.append_event")
+    def test_basic_logging(self, mock_append_event, mock_resolve_path):
         """
-        Ensure we can initialize logging and write a basic JSON log line.
+        Validate basic JSON logging with directory_contract and no rollover triggered.
         """
+        # Mock directory_contract to return our temp logs dir for "logs"
+        logs_path = Path(self.temp_dir)
+        mock_resolve_path.return_value = logs_path
+
+        # Ensure logs dir exists
+        os.mkdir(logs_path)
+
         init_logging(
-            log_path=self.temp_dir,
             scif_mode=False,
             manual_override_allowed=False,
             debug_console=False
@@ -52,11 +50,11 @@ class TestLoggingSetup(unittest.TestCase):
         logger = get_logger("test_subsystem")
         logger.info("Hello from test_logging")
 
-        logfile = os.path.join(self.temp_dir, "sentinel.log")
+        logfile = logs_path / "sentinel.log"
         with open(logfile, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
-        self.assertEqual(len(lines), 1)
+        self.assertEqual(len(lines), 1, "Expected exactly one log line.")
         data = json.loads(lines[0])
         self.assertIn("timestamp", data)
         self.assertIn("subsystem", data)
@@ -67,13 +65,21 @@ class TestLoggingSetup(unittest.TestCase):
         self.assertEqual(data["event_code"], "INFO")
         self.assertEqual(data["message"], "Hello from test_logging")
 
-    def test_rotation(self):
+        # No rollover => no call to append_event
+        mock_append_event.assert_not_called()
+
+    @patch("aepok_sentinel.core.logging_setup.resolve_path")
+    @patch("aepok_sentinel.core.logging_setup.audit_chain.append_event")
+    def test_rotation_with_chain_event(self, mock_append_event, mock_resolve_path):
         """
-        Write logs until rotation triggers, ensure multiple files exist.
-        Also verify that a 'LOG_ROTATED' event is recorded in the new log file.
+        Force rollover and confirm that 'LOG_ROTATED' is appended to the new log file
+        AND appended to the audit chain.
         """
+        logs_path = Path(self.temp_dir)
+        mock_resolve_path.return_value = logs_path
+        os.mkdir(logs_path)
+
         init_logging(
-            log_path=self.temp_dir,
             scif_mode=False,
             manual_override_allowed=False,
             debug_console=False,
@@ -82,96 +88,97 @@ class TestLoggingSetup(unittest.TestCase):
         )
         logger = get_logger("rotate_test")
 
-        # Write enough lines to exceed 200 bytes at least once
         for i in range(20):
             logger.info(f"Line {i}")
 
-        # Check the directory for multiple log files (sentinel.log, sentinel.log.1, etc.)
-        log_files = os.listdir(self.temp_dir)
+        # Check for multiple log files
+        log_files = os.listdir(logs_path)
         possible_logs = [f for f in log_files if f.startswith("sentinel.log")]
-        self.assertTrue(
-            len(possible_logs) >= 2,
-            "Expected log rotation to produce multiple files"
+        self.assertGreaterEqual(
+            len(possible_logs), 2,
+            "Expected log rotation to produce multiple files."
         )
 
-        # Verify 'LOG_ROTATED' event in the current sentinel.log
-        current_logfile = os.path.join(self.temp_dir, "sentinel.log")
+        # Verify 'LOG_ROTATED' in the current sentinel.log
+        current_logfile = logs_path / "sentinel.log"
         with open(current_logfile, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
         found_log_rotated = any(
-            (json.loads(line).get("event_code") == "LOG_ROTATED")
-            for line in lines
+            (json.loads(line).get("event_code") == "LOG_ROTATED") for line in lines
         )
-        self.assertTrue(
-            found_log_rotated,
-            "Expected a LOG_ROTATED event in the new log file after rotation"
+        self.assertTrue(found_log_rotated, "Expected a LOG_ROTATED event in the new log file.")
+
+        # Also verify that the audit chain was updated
+        mock_append_event.assert_any_call(
+            event="LOG_ROTATED",
+            metadata={"logfile": str(current_logfile)}
         )
 
-    def test_scif_mode_suppression(self):
+    @patch("aepok_sentinel.core.logging_setup.resolve_path")
+    def test_missing_logs_directory(self, mock_resolve_path):
         """
-        In SCIF mode, console logs are suppressed unless debug_console + manual_override_allowed.
-        We'll mock sys.stdout to see if anything is printed.
+        If 'logs' directory doesn't exist, raise LoggingSetupError.
         """
-        # case 1: scif_mode=True, debug_console=False => no console output
-        with patch("sys.stdout", new_callable=lambda: open(os.devnull, "w")):
+        mock_resolve_path.return_value = Path(self.temp_dir) / "missing_logs"
+
+        with self.assertRaises(LoggingSetupError) as cm:
             init_logging(
-                log_path=self.temp_dir,
-                scif_mode=True,
-                manual_override_allowed=False,
-                debug_console=False
-            )
-            logger = get_logger("scif_subsystem")
-            logger.info("SCIF console test")
-            # Check no console handler
-            self.assertIsNone(_CONSOLE_HANDLER)
-
-        # case 2: scif_mode=True, debug_console=True but manual_override_allowed=False => still suppressed
-        with patch("sys.stdout", new_callable=lambda: open(os.devnull, "w")):
-            global _LOGGING_INITIALIZED, _FILE_HANDLER, _CONSOLE_HANDLER
-            _LOGGING_INITIALIZED = False
-            _FILE_HANDLER = None
-            _CONSOLE_HANDLER = None
-
-            init_logging(
-                log_path=self.temp_dir,
-                scif_mode=True,
-                manual_override_allowed=False,
-                debug_console=True
-            )
-            logger = get_logger("scif_subsystem")
-            logger.info("SCIF console test2")
-            self.assertIsNone(_CONSOLE_HANDLER)
-
-        # case 3: scif_mode=True, debug_console=True, manual_override_allowed=True => console enabled
-        with patch("sys.stdout", new_callable=lambda: open(os.devnull, "w")):
-            global _LOGGING_INITIALIZED, _FILE_HANDLER, _CONSOLE_HANDLER
-            _LOGGING_INITIALIZED = False
-            _FILE_HANDLER = None
-            _CONSOLE_HANDLER = None
-
-            init_logging(
-                log_path=self.temp_dir,
-                scif_mode=True,
-                manual_override_allowed=True,
-                debug_console=True
-            )
-            logger = get_logger("scif_subsystem")
-            logger.info("SCIF console test3")
-            self.assertIsNotNone(_CONSOLE_HANDLER)
-
-    def test_invalid_log_path(self):
-        """
-        If the log path is invalid or not creatable, must raise LoggingSetupError.
-        """
-        fake_path = os.path.join(self.temp_dir, "nonexistent", "denied")
-        with self.assertRaises(LoggingSetupError):
-            init_logging(
-                log_path=fake_path,
                 scif_mode=False,
                 manual_override_allowed=False,
                 debug_console=False
             )
+        self.assertIn("Logs directory not found", str(cm.exception))
+
+    @patch("aepok_sentinel.core.logging_setup.resolve_path")
+    def test_scif_mode_suppression(self, mock_resolve_path):
+        """
+        In SCIF mode, console logs are off unless debug_console and manual_override_allowed.
+        """
+        logs_path = Path(self.temp_dir)
+        mock_resolve_path.return_value = logs_path
+        os.mkdir(logs_path)
+
+        # scif_mode=True, debug_console=False => no console
+        init_logging(
+            scif_mode=True,
+            manual_override_allowed=False,
+            debug_console=False
+        )
+        logger = get_logger("scif_test")
+        logger.info("Testing scif_mode console off")
+        self.assertIsNone(_CONSOLE_HANDLER)
+
+        # Reset logging
+        global _LOGGING_INITIALIZED, _FILE_HANDLER, _CONSOLE_HANDLER
+        _LOGGING_INITIALIZED = False
+        _FILE_HANDLER = None
+        _CONSOLE_HANDLER = None
+
+        # scif_mode=True, debug_console=True but manual_override_allowed=False => still off
+        init_logging(
+            scif_mode=True,
+            manual_override_allowed=False,
+            debug_console=True
+        )
+        logger = get_logger("scif_test")
+        logger.info("Testing scif_mode console override no-permission")
+        self.assertIsNone(_CONSOLE_HANDLER)
+
+        # Reset logging again
+        _LOGGING_INITIALIZED = False
+        _FILE_HANDLER = None
+        _CONSOLE_HANDLER = None
+
+        # scif_mode=True, debug_console=True, manual_override_allowed=True => console on
+        init_logging(
+            scif_mode=True,
+            manual_override_allowed=True,
+            debug_console=True
+        )
+        logger = get_logger("scif_test")
+        logger.info("Testing scif_mode console override allowed")
+        self.assertIsNotNone(_CONSOLE_HANDLER)
 
 
 if __name__ == "__main__":
