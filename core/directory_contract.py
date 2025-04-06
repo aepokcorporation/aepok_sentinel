@@ -43,7 +43,7 @@ from pathlib import Path
 #
 # No code in Aepok Sentinel should ever override or create subpaths automatically.
 
-SENTINEL_RUNTIME_BASE = Path("/home/tyler/aepok_sentinel/runtime")
+SENTINEL_RUNTIME_BASE = SENTINEL_RUNTIME_BASE = Path("/opt/aepok_sentinel/runtime")
 
 # ---------------------------------------------------------------------------------
 # REQUIRED DIRECTORY & FILE STRUCTURE
