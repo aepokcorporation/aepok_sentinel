@@ -38,12 +38,12 @@ from pathlib import Path
 # All runtime subdirectories (config, keys, license, etc.) must exist under this path.
 #
 # In a final SCIF/airgap install, this should be a sealed location like:
-#    /home/tyler/aepok_sentinel/runtime
+#    /opsec/aepok_sentinel/runtime
 # or an equivalent path specified at install time.
 #
 # No code in Aepok Sentinel should ever override or create subpaths automatically.
 
-SENTINEL_RUNTIME_BASE = SENTINEL_RUNTIME_BASE = Path("/opt/aepok_sentinel/runtime")
+SENTINEL_RUNTIME_BASE = SENTINEL_RUNTIME_BASE = Path("/opsec/aepok_sentinel/runtime")
 
 # ---------------------------------------------------------------------------------
 # REQUIRED DIRECTORY & FILE STRUCTURE
