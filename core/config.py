@@ -267,6 +267,7 @@ def load_config(parse_env: bool = True) -> SentinelConfig:
             "enforcement_mode": cfg.enforcement_mode,
             "schema_version": cfg.schema_version,
             "signature_verified": validated_data.get("_signature_verified", None)
+            "origin": "environment" if os.environ.get("SENTINEL_MODE") else "static"
         }
     )
 
