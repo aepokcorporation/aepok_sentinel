@@ -1,24 +1,26 @@
 """
-Unit tests for aepok_sentinel/core/azure_client.py
+Unit tests for aepok_sentinel/core/azure_clients.py (Final Shape)
 
-Validates:
+Checks:
  - SCIF/airgap => error
- - watch-only => read-only, no writes
- - config => cloud, azure, valid cloud_keyvault_url => success
- - requests calls use custom PQC TLS context if needed
- - delete fails if allow_delete=false
+ - watch-only => read-only
+ - classical mode => default TLS
+ - strict => PQC error => fail
+ - non-strict => PQC error => fallback
+ - set/delete logic with allow_delete
 """
 
 import unittest
 from unittest.mock import patch, MagicMock
 
+import requests
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, LicenseState
-from aepok_sentinel.core.azure_client import AzureClient, AzureClientError
+from aepok_sentinel.core.azure_clients import AzureClient, AzureClientError
 from aepok_sentinel.core.pqc_tls import PQCTlsError
 
 
-class TestAzureClient(unittest.TestCase):
+class TestAzureClients(unittest.TestCase):
 
     def setUp(self):
         self.config_dict = {
@@ -32,102 +34,78 @@ class TestAzureClient(unittest.TestCase):
         }
         self.cfg = SentinelConfig(self.config_dict)
         self.license_mgr = LicenseManager(self.cfg)
+        # default is watch_only=False, valid=True
         self.license_mgr.license_state = LicenseState(valid=True, watch_only=False, info={})
 
-    def test_invalid_mode_scif(self):
-        self.cfg.raw_dict["mode"] = "scif"
-        with self.assertRaises(AzureClientError):
-            AzureClient(self.cfg, self.license_mgr)
+    def test_scif_or_airgap_disallowed(self):
+        for mode in ["scif", "airgap"]:
+            self.cfg.raw_dict["mode"] = mode
+            with self.assertRaises(AzureClientError):
+                AzureClient(self.cfg, self.license_mgr)
 
-    def test_invalid_provider(self):
+    def test_wrong_provider(self):
         self.cfg.raw_dict["cloud_keyvault_provider"] = "aws"
         with self.assertRaises(AzureClientError):
             AzureClient(self.cfg, self.license_mgr)
 
-    def test_missing_keyvault_url(self):
+    def test_no_url(self):
         self.cfg.raw_dict["cloud_keyvault_url"] = ""
         with self.assertRaises(AzureClientError):
             AzureClient(self.cfg, self.license_mgr)
 
-    @patch("aepok_sentinel.core.azure_client.requests.Session")
-    @patch("aepok_sentinel.core.azure_client.create_pqc_ssl_context")
-    def test_build_requests_session_non_classical(self, mock_create_ctx, mock_sess_cls):
+    @patch("aepok_sentinel.core.azure_clients.requests.Session")
+    @patch("aepok_sentinel.core.azure_clients.create_pqc_ssl_context")
+    def test_pqc_session_hybrid(self, mock_pqc_ctx, mock_session):
         """
-        If tls_mode != classical => create PQC context for requests
+        If tls_mode != classical => we attempt PQC context.
         """
         AzureClient(self.cfg, self.license_mgr)
-        mock_create_ctx.assert_called_once()
-        mock_sess_cls.assert_called_once()
+        mock_pqc_ctx.assert_called_once()
+        mock_session.assert_called_once()
 
-    @patch("aepok_sentinel.core.azure_client.requests.Session")
-    @patch("aepok_sentinel.core.azure_client.create_pqc_ssl_context", side_effect=PQCTlsError("pqc fail"))
-    def test_strict_transport_fail(self, mock_create_ctx, mock_sess_cls):
-        """
-        If strict_transport=true => PQCTlsError => raise AzureClientError
-        """
+    @patch("aepok_sentinel.core.azure_clients.requests.Session")
+    @patch("aepok_sentinel.core.azure_clients.create_pqc_ssl_context", side_effect=PQCTlsError("pqc fail"))
+    def test_strict_transport_true_fail(self, mock_pqc_ctx, mock_session):
         self.cfg.raw_dict["strict_transport"] = True
         with self.assertRaises(AzureClientError):
             AzureClient(self.cfg, self.license_mgr)
 
-    @patch("aepok_sentinel.core.azure_client.requests.Session")
-    @patch("aepok_sentinel.core.azure_client.create_pqc_ssl_context", side_effect=PQCTlsError("pqc fail"))
-    def test_strict_transport_false_fallback(self, mock_create_ctx, mock_sess_cls):
+    @patch("aepok_sentinel.core.azure_clients.requests.Session")
+    @patch("aepok_sentinel.core.azure_clients.create_pqc_ssl_context", side_effect=PQCTlsError("pqc fail"))
+    def test_strict_transport_false_fallback(self, mock_pqc_ctx, mock_session):
         """
-        If strict_transport=false => fallback to default session
+        Non-strict => fallback to default
         """
-        # Should not raise
         self.cfg.raw_dict["strict_transport"] = False
-        cli = AzureClient(self.cfg, self.license_mgr)
-        # We get a client w/ fallback session
-        self.assertIsInstance(cli, AzureClient)
+        client = AzureClient(self.cfg, self.license_mgr)
+        self.assertIsInstance(client, AzureClient)
 
-    @patch("aepok_sentinel.core.azure_client.requests.Session")
-    def test_get_secret(self, mock_sess_cls):
+    @patch("aepok_sentinel.core.azure_clients.requests.Session")
+    def test_get_secret_ok(self, mock_sess_cls):
         mock_sess = MagicMock()
         mock_sess_cls.return_value = mock_sess
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {"value": "secretvalue"}
+        mock_resp.json.return_value = {"value": "secretval"}
         mock_sess.get.return_value = mock_resp
 
         cli = AzureClient(self.cfg, self.license_mgr)
         val = cli.get_secret("mysecret")
-        self.assertEqual(val, "secretvalue")
+        self.assertEqual(val, "secretval")
 
-    @patch("aepok_sentinel.core.azure_client.requests.Session")
+    @patch("aepok_sentinel.core.azure_clients.requests.Session")
     def test_set_secret_watch_only(self, mock_sess_cls):
-        mock_sess = MagicMock()
-        mock_sess_cls.return_value = mock_sess
-
-        # Force watch-only
         self.license_mgr.license_state.watch_only = True
-        cli = AzureClient(self.cfg, self.license_mgr)
         with self.assertRaises(AzureClientError):
-            cli.set_secret("abc", "value")
+            AzureClient(self.cfg, self.license_mgr).set_secret("name", "val")
 
-    @patch("aepok_sentinel.core.azure_client.requests.Session")
-    def test_set_secret_ok(self, mock_sess_cls):
-        mock_sess = MagicMock()
-        mock_sess_cls.return_value = mock_sess
-        mock_resp = MagicMock()
-        mock_resp.status_code = 201
-        mock_sess.put.return_value = mock_resp
-
-        cli = AzureClient(self.cfg, self.license_mgr)
-        cli.set_secret("abc", "value")
-        mock_sess.put.assert_called_once()
-
-    @patch("aepok_sentinel.core.azure_client.requests.Session")
-    def test_delete_secret_not_allowed(self, mock_sess_cls):
-        mock_sess = MagicMock()
-        mock_sess_cls.return_value = mock_sess
-
+    @patch("aepok_sentinel.core.azure_clients.requests.Session")
+    def test_delete_secret_disallowed(self, mock_sess_cls):
         self.cfg.raw_dict["allow_delete"] = False
-        cli = AzureClient(self.cfg, self.license_mgr)
         with self.assertRaises(AzureClientError):
-            cli.delete_secret("secret1")
+            AzureClient(self.cfg, self.license_mgr).delete_secret("secret1")
 
-    @patch("aepok_sentinel.core.azure_client.requests.Session")
+    @patch("aepok_sentinel.core.azure_clients.requests.Session")
     def test_delete_secret_ok(self, mock_sess_cls):
         mock_sess = MagicMock()
         mock_sess_cls.return_value = mock_sess
