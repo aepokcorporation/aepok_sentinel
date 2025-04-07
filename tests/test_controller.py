@@ -1,115 +1,118 @@
-"""
-Unit tests for Step 8: aepok_sentinel/core/controller.py
-
-Validates:
- - boot() => loads config, license, key manager, daemon
- - watch-only => no daemon started
- - stop() => halts daemon
- - restart() => re-boots after stop
- - supervise => if daemon crashes, logs and attempts single restart
-"""
-
 import os
+import json
 import unittest
 import tempfile
-import json
-import time
+import shutil
+import base64
 from unittest.mock import patch, MagicMock
 
 from aepok_sentinel.core.controller import SentinelController, ControllerError
-from aepok_sentinel.core.config import SentinelConfig
-from aepok_sentinel.core.license import LicenseManager
-from aepok_sentinel.core.security_daemon import SecurityDaemon
+from aepok_sentinel.core.constants import EventCode
 
-
-class TestController(unittest.TestCase):
+class TestControllerFinalShape(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
-        self.config_path = os.path.join(self.temp_dir, ".sentinelrc")
-        self.state_path = os.path.join(self.temp_dir, "daemon_state.json")
+        self.config_path = os.path.join(self.temp_dir, "sentinelrc.json")
+        self.sig_path = self.config_path + ".sig"
+        self.pub_path = os.path.join(self.temp_dir, "sentinelrc_dilithium_pub.pem")
+        self.state_path = os.path.join(self.temp_dir, "state.json")
+        self.runtime_base = os.path.join(self.temp_dir, "runtime")
+        os.makedirs(self.runtime_base)
+
+        # Write config
+        self.config_data = {
+            "schema_version": 1,
+            "mode": "cloud",
+            "enforcement_mode": "STRICT",
+            "license_required": True
+        }
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            json.dump(self.config_data, f)
+
+        # Fake pubkey
+        with open(self.pub_path, "wb") as f:
+            f.write(b"MOCK_PUBKEY")
+
+        # Fake signature
+        fake_sig = base64.b64encode(json.dumps({"dilithium": "mock"}).encode("utf-8"))
+        with open(self.sig_path, "wb") as f:
+            f.write(fake_sig)
+
+        # trust_anchor.json
+        self.trust_path = os.path.join(self.runtime_base, "trust_anchor.json")
+        self.trust_sig = self.trust_path + ".sig"
+        trust_data = {
+            "vendor_dil_pub_sha256": "mockedsha256hash"
+        }
+        with open(self.trust_path, "w", encoding="utf-8") as f:
+            json.dump(trust_data, f)
+        trust_sig = base64.b64encode(json.dumps({"sig": "mock"}).encode("utf-8"))
+        with open(self.trust_sig, "wb") as f:
+            f.write(trust_sig)
+
+        # identity.json
+        self.identity_path = os.path.join(self.runtime_base, "identity.json")
+        self.identity_sig = self.identity_path + ".sig"
+        with open(self.identity_path, "w", encoding="utf-8") as f:
+            json.dump({"fingerprint": "host123"}, f)
+        ident_sig = base64.b64encode(json.dumps({"sig": "mock"}).encode("utf-8"))
+        with open(self.identity_sig, "wb") as f:
+            f.write(ident_sig)
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def _write_config(self, data: dict):
-        with open(self.config_path, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+    @patch("aepok_sentinel.core.controller.verify_content_signature", return_value=True)
+    @patch("aepok_sentinel.core.controller.get_host_fingerprint", return_value="host123")
+    @patch("aepok_sentinel.core.controller.SentinelController._verify_file_hash")
+    @patch("aepok_sentinel.core.controller.LicenseManager.load_license")
+    @patch("aepok_sentinel.core.controller.AuditChain.append_event")
+    @patch("aepok_sentinel.core.controller.validate_runtime_structure")
+    @patch("aepok_sentinel.core.controller.shutil.disk_usage")
+    def test_full_boot_passes_strict(
+        self, mock_disk, mock_validate, mock_append, mock_lic, mock_hash, mock_fp, mock_sig
+    ):
+        mock_disk.return_value = MagicMock(free=999999999)
+        ctrl = SentinelController(self.config_path, self.runtime_base, self.state_path)
+        ctrl.boot()
+        self.assertEqual(ctrl._host_fingerprint, "host123")
+        self.assertTrue(ctrl._license_uuid != "")
+        last_event = mock_append.call_args_list[-1][0][0]
+        self.assertEqual(last_event, EventCode.CONTROLLER_BOOT.value)
 
-    def test_boot_fail_config_missing(self):
-        ctrl = SentinelController(config_path="/nonexistent/sentinelrc")
+    @patch("aepok_sentinel.core.controller.verify_content_signature", return_value=False)
+    @patch("aepok_sentinel.core.controller.shutil.disk_usage")
+    def test_config_sig_fail_halts_boot(self, mock_disk, mock_verify):
+        mock_disk.return_value = MagicMock(free=999999999)
         with self.assertRaises(ControllerError):
-            ctrl.boot()
+            SentinelController(self.config_path, self.runtime_base, self.state_path).boot()
 
-    def test_boot_success_watch_only(self):
-        # watch-only => no daemon
-        data = {
-            "schema_version": 1,
-            "mode": "watch-only"
-        }
-        self._write_config(data)
-        ctrl = SentinelController(self.config_path, self.state_path)
-        ctrl.boot()
-        self.assertFalse(ctrl._running)
-        self.assertIsNone(ctrl.security_daemon)
+    @patch("aepok_sentinel.core.controller.verify_content_signature", return_value=True)
+    @patch("aepok_sentinel.core.controller.get_host_fingerprint", return_value="host123")
+    @patch("aepok_sentinel.core.controller.shutil.disk_usage")
+    def test_disk_check_failure(self, mock_disk, mock_fp, mock_verify):
+        mock_disk.return_value = MagicMock(free=1024)  # Low disk
+        with self.assertRaises(ControllerError):
+            SentinelController(self.config_path, self.runtime_base, self.state_path).boot()
 
-    @patch("aepok_sentinel.core.security_daemon.SecurityDaemon.start")
-    def test_boot_success_with_daemon(self, mock_daemon_start):
-        data = {
-            "schema_version": 1,
-            "mode": "cloud"
-        }
-        self._write_config(data)
-        ctrl = SentinelController(self.config_path, self.state_path)
-        ctrl.boot()
-        self.assertTrue(ctrl._running)
-        self.assertIsNotNone(ctrl.security_daemon)
-        mock_daemon_start.assert_called_once()
+    @patch("aepok_sentinel.core.controller.verify_content_signature", return_value=True)
+    @patch("aepok_sentinel.core.controller.get_host_fingerprint", return_value="host123")
+    @patch("aepok_sentinel.core.controller.SentinelController._verify_file_hash", side_effect=ControllerError("hash fail"))
+    @patch("aepok_sentinel.core.controller.shutil.disk_usage")
+    def test_vendor_pub_hash_fail(self, mock_disk, mock_hash, mock_fp, mock_verify):
+        mock_disk.return_value = MagicMock(free=999999999)
+        with self.assertRaises(ControllerError):
+            SentinelController(self.config_path, self.runtime_base, self.state_path).boot()
 
-    @patch("aepok_sentinel.core.security_daemon.SecurityDaemon.start")
-    def test_stop_daemon(self, mock_daemon_start):
-        data = {
-            "schema_version": 1,
-            "mode": "cloud"
-        }
-        self._write_config(data)
-        ctrl = SentinelController(self.config_path, self.state_path)
-        ctrl.boot()
-        self.assertTrue(ctrl._running)
-        ctrl.stop()
-        self.assertFalse(ctrl._running)
-
-    @patch("aepok_sentinel.core.security_daemon.SecurityDaemon.start")
-    @patch("aepok_sentinel.core.security_daemon.SecurityDaemon.stop")
-    def test_restart(self, mock_daemon_stop, mock_daemon_start):
-        data = {
-            "schema_version": 1,
-            "mode": "cloud"
-        }
-        self._write_config(data)
-        ctrl = SentinelController(self.config_path, self.state_path)
-        ctrl.boot()
-        self.assertTrue(ctrl._running)
-        ctrl.restart()
-        # ensure start was called at least twice (first boot + second after restart)
-        self.assertGreaterEqual(mock_daemon_start.call_count, 2)
-
-    @patch("aepok_sentinel.core.security_daemon.SecurityDaemon.start", side_effect=[Exception("crash once"), None])
-    @patch("aepok_sentinel.core.security_daemon.SecurityDaemon.stop")
-    def test_daemon_crash_supervise(self, mock_daemon_stop, mock_daemon_start):
-        data = {
-            "schema_version": 1,
-            "mode": "cloud"
-        }
-        self._write_config(data)
-        ctrl = SentinelController(self.config_path, self.state_path)
-        ctrl.boot()
-        time.sleep(2)  # let the _daemon_loop handle the exception
-        # first call => exception => second => success
-        self.assertFalse(ctrl._running, "Should eventually set _running=False after second crash or success.")
-        # Actually in code, we do one attempt to restart, if the second fails => we end.
-        # if second is success => we might be running. We'll not complicate it. Just ensuring no crash.
+    @patch("aepok_sentinel.core.controller.verify_content_signature", return_value=True)
+    @patch("aepok_sentinel.core.controller.get_host_fingerprint", return_value="host123")
+    @patch("aepok_sentinel.core.controller.LicenseManager.load_license", side_effect=ControllerError("license fail"))
+    @patch("aepok_sentinel.core.controller.shutil.disk_usage")
+    def test_license_load_fails_in_strict(self, mock_disk, mock_lic, mock_fp, mock_verify):
+        mock_disk.return_value = MagicMock(free=999999999)
+        with self.assertRaises(ControllerError):
+            SentinelController(self.config_path, self.runtime_base, self.state_path).boot()
 
 if __name__ == "__main__":
     unittest.main()
