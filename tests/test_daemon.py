@@ -35,7 +35,7 @@ class TestSecurityDaemon(unittest.TestCase):
             "use_inotify": False,
             "daemon_poll_interval": 1,
             "quarantine_enabled": True,
-            "chain_verification_on_decrypt": False  # not used here
+            "chain_verification_on_decrypt": False
         }
         self.cfg = SentinelConfig(self.config_dict)
         self.license_mgr = LicenseManager(self.cfg)
@@ -57,7 +57,6 @@ class TestSecurityDaemon(unittest.TestCase):
             f.write("content1")
 
         # modify => tamper
-        # run process_file => expect a TAMPER_DETECTED log but not quarantined
         self.daemon._process_file(fpath)
         # file should still exist
         self.assertTrue(os.path.isfile(fpath))
@@ -95,7 +94,7 @@ class TestSecurityDaemon(unittest.TestCase):
         import json
         rec1 = json.loads(lines[0])
         rec2 = json.loads(lines[1])
-        self.assertEqual(rec1["event"], "TAMPER_DETECTED")  # or it might be no direct tamper event, we do it?
+        self.assertEqual(rec1["event"], "TAMPER_DETECTED")
         self.assertEqual(rec2["event"], "FILE_QUARANTINED")
 
     @patch("aepok_sentinel.utils.malware_db.MalwareDatabase.check_file", return_value="BadMalware")
@@ -122,7 +121,6 @@ class TestSecurityDaemon(unittest.TestCase):
         # scif => no external calls, but we still do local scanning
         self.cfg.raw_dict["mode"] = "scif"
         # in scif => we do local scanning
-        # We'll just confirm we can process a file
         fpath = os.path.join(self.temp_dir, "doc.txt")
         with open(fpath, "w", encoding="utf-8") as f:
             f.write("scif data")
@@ -130,17 +128,11 @@ class TestSecurityDaemon(unittest.TestCase):
         # no error => local scanning done
 
     def test_daemon_poll_stop(self):
-        # just test that calling start & stop won't crash
-        # we'll run in a thread
         import threading
 
         t = threading.Thread(target=self.daemon.start)
         t.start()
-        time.sleep(2)  # let it poll a bit
+        time.sleep(2)
         self.daemon.stop()
         t.join()
         self.assertFalse(t.is_alive())
-
-
-if __name__ == "__main__":
-    unittest.main()
