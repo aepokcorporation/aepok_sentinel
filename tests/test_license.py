@@ -1,232 +1,221 @@
+# tests/test_license.py
 """
-Unit tests for aepok_sentinel/core/license.py
+Final-shape tests for aepok_sentinel/core/license.py
 
-Validates:
-- Missing/corrupt license => watch-only or error if license_required=true
-- Signature check (we mock out the pqc_crypto verify function)
-- Expired => watch-only
-- Hardware mismatch => watch-only
-- Bound hardware with license_required => raise LicenseError or degrade
-- Valid => fully valid
+Verifies:
+ - The new sealed identity usage
+ - The install_state usage
+ - The chain events (LICENSE_ACTIVATED, LICENSE_INVALID, LICENSE_EXPIRED, INSTALL_REJECTED)
 """
 
 import os
-import unittest
 import json
-import base64
+import shutil
+import unittest
+import tempfile
 from unittest.mock import patch, MagicMock
 
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import (
-    LicenseManager, LicenseError, is_watch_only, is_license_valid
+    LicenseManager, LicenseError,
+    is_watch_only, is_license_valid
 )
+from aepok_sentinel.core.audit_chain import AuditChain
 
 
-class TestLicense(unittest.TestCase):
+class TestLicenseFinalShape(unittest.TestCase):
 
     def setUp(self):
-        self.config_dict = {
+        self.temp_dir = tempfile.mkdtemp()
+        # minimal config
+        self.cfg_dict = {
             "schema_version": 1,
             "mode": "cloud",
             "license_required": False,
             "bound_to_hardware": False,
             "allow_classical_fallback": True,
-            "license_path": "test_license.json"
+            "license_path": os.path.join(self.temp_dir, "license.key"),
+            "enforcement_mode": "PERMISSIVE"  # can set to HARDENED in some tests
         }
+        self.cfg = SentinelConfig(self.cfg_dict)
+        # create runtime base
+        self.runtime_base = os.path.join(self.temp_dir, "runtime")
+        os.mkdir(self.runtime_base)
+        # create license dir
+        license_dir = os.path.join(self.runtime_base, "license")
+        os.mkdir(license_dir)
+        # identity.json => if bound_to_hardware => we read host_fingerprint
+        config_dir = os.path.join(self.runtime_base, "config")
+        os.mkdir(config_dir)
+        with open(os.path.join(config_dir, "identity.json"), "w", encoding="utf-8") as f:
+            # minimal identity
+            f.write(json.dumps({"fingerprint": "local_host_fp"}))
 
-        # We'll create a small JSON license in memory
-        # "signature" is base64 of a JSON dict with "dilithium"/"rsa"
-        self.license_data = {
+        # place a default install_state.json
+        with open(os.path.join(license_dir, "install_state.json"), "w", encoding="utf-8") as f:
+            json.dump({}, f)
+
+        self.audit_chain = AuditChain(chain_dir=self.temp_dir)
+        self.manager = LicenseManager(self.cfg, audit_chain=self.audit_chain, sentinel_runtime_base=self.runtime_base)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _read_chain_events(self):
+        if not os.path.isfile(self.audit_chain.current_file_path):
+            return []
+        with open(self.audit_chain.current_file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        return [json.loads(ln) for ln in lines]
+
+    def test_file_not_found(self):
+        """
+        No license file => watch_only. Also logs LICENSE_INVALID with reason=file_missing
+        """
+        self.manager.load_license()
+        self.assertTrue(is_watch_only(self.manager))
+        self.assertFalse(is_license_valid(self.manager))
+        events = self._read_chain_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "LICENSE_INVALID")
+        self.assertIn("file_missing", events[0]["metadata"]["reason"])
+
+    @patch("aepok_sentinel.core.license.LicenseManager._verify_license_signature", return_value=True)
+    def test_valid_license_activated(self, mock_verify):
+        """
+        If license is valid => chain logs LICENSE_ACTIVATED
+        """
+        # write a simple license
+        lic_data = {
             "license_version": 1,
+            "license_uuid": "abcd-1234",
             "issued_to": "TestUser",
             "expires_on": "9999-12-31",
-            "signature": "",
-            "features": ["full_encryption"],
-            "license_type": "individual"
+            "signature": "base64_of_signature"
         }
+        with open(self.manager.license_path, "w", encoding="utf-8") as f:
+            json.dump(lic_data, f)
 
-        # We mock the filesystem read in each test so we don't need actual files.
+        self.manager.load_license()
+        self.assertTrue(is_license_valid(self.manager))
+        self.assertFalse(is_watch_only(self.manager))
+        evts = self._read_chain_events()
+        self.assertEqual(len(evts), 1)
+        self.assertEqual(evts[0]["event"], "LICENSE_ACTIVATED")
+        self.assertEqual(evts[0]["metadata"]["license_uuid"], "abcd-1234")
 
-    @patch("os.path.isfile", return_value=True)
-    @patch("builtins.open", create=True)
-    def test_valid_license(self, mock_open, mock_isfile):
-        """
-        If license is valid, not expired, signature passes => valid = True, watch_only = False
-        """
-        # We'll produce a dummy signature with base64 of {"dilithium":"abc", "rsa":"xyz"}
-        sig_dict = {"dilithium": "abc", "rsa": "xyz"}
-        sig_b64 = base64.b64encode(json.dumps(sig_dict).encode("utf-8")).decode("utf-8")
-        self.license_data["signature"] = sig_b64
-
-        file_content = json.dumps(self.license_data).encode("utf-8")
-        mock_open.return_value.__enter__.return_value.read.return_value = file_content
-
-        # mock the verify_content_signature call to return True
-        with patch("aepok_sentinel.core.license.verify_content_signature", return_value=True):
-            cfg = SentinelConfig(self.config_dict)
-            lm = LicenseManager(cfg)
-            lm.load_license()
-
-            self.assertTrue(is_license_valid(lm))
-            self.assertFalse(is_watch_only(lm))
-
-    @patch("os.path.isfile", return_value=True)
-    @patch("builtins.open", create=True)
-    def test_missing_signature(self, mock_open, mock_isfile):
-        """
-        If signature is missing => degrade watch-only or raise if license_required
-        """
-        data_no_sig = {
+    @patch("aepok_sentinel.core.license.LicenseManager._verify_license_signature", return_value=False)
+    def test_signature_fail(self, mock_verify):
+        lic_data = {
             "license_version": 1,
-            "issued_to": "TestUser",
-            "expires_on": "9999-12-31"
+            "license_uuid": "xyz-999",
+            "issued_to": "UserB",
+            "expires_on": "9999-12-31",
+            "signature": "some_base64"
         }
-        file_content = json.dumps(data_no_sig).encode("utf-8")
-        mock_open.return_value.__enter__.return_value.read.return_value = file_content
+        with open(self.manager.license_path, "w", encoding="utf-8") as f:
+            json.dump(lic_data, f)
 
-        # license_required = false => degrade
-        cfg_dict = self.config_dict.copy()
-        cfg_dict["license_required"] = False
-        cfg = SentinelConfig(cfg_dict)
-        lm = LicenseManager(cfg)
-        lm.load_license()
-        self.assertFalse(is_license_valid(lm))
-        self.assertTrue(is_watch_only(lm))
+        self.manager.load_license()
+        self.assertTrue(is_watch_only(self.manager))
+        self.assertFalse(is_license_valid(self.manager))
+        evts = self._read_chain_events()
+        self.assertEqual(evts[0]["event"], "LICENSE_INVALID")
+        self.assertIn("signature_fail", evts[0]["metadata"]["reason"])
 
-        # license_required = true => raise
-        cfg_dict2 = self.config_dict.copy()
-        cfg_dict2["license_required"] = True
-        cfg2 = SentinelConfig(cfg_dict2)
-        lm2 = LicenseManager(cfg2)
-        with self.assertRaises(LicenseError):
-            lm2.load_license()
-
-    @patch("os.path.isfile", return_value=True)
-    @patch("builtins.open", create=True)
-    def test_expired_license(self, mock_open, mock_isfile):
-        """
-        If expires_on < today => degrade watch-only
-        """
-        data_expired = {
+    @patch("aepok_sentinel.core.license.LicenseManager._verify_license_signature", return_value=True)
+    def test_expired_license(self, mock_verify):
+        lic_data = {
             "license_version": 1,
-            "issued_to": "OldUser",
+            "license_uuid": "expired-lic",
+            "issued_to": "UserExpired",
             "expires_on": "2000-01-01",
-            "signature": "dummy",
+            "signature": "somebase64"
         }
-        file_content = json.dumps(data_expired).encode("utf-8")
-        mock_open.return_value.__enter__.return_value.read.return_value = file_content
+        with open(self.manager.license_path, "w", encoding="utf-8") as f:
+            json.dump(lic_data, f)
 
-        # Also mock verify => True
-        with patch("aepok_sentinel.core.license.verify_content_signature", return_value=True):
-            cfg = SentinelConfig(self.config_dict)
-            lm = LicenseManager(cfg)
-            lm.load_license()
-            self.assertFalse(is_license_valid(lm))
-            self.assertTrue(is_watch_only(lm))
+        self.manager.load_license()
+        self.assertTrue(is_watch_only(self.manager))
+        self.assertFalse(is_license_valid(self.manager))
+        evts = self._read_chain_events()
+        self.assertEqual(len(evts), 1)
+        self.assertEqual(evts[0]["event"], "LICENSE_EXPIRED")
 
-    @patch("os.path.isfile", return_value=True)
-    @patch("builtins.open", create=True)
-    def test_tampered_signature(self, mock_open, mock_isfile):
-        """
-        If signature check fails => degrade watch-only or raise if required
-        """
-        self.license_data["signature"] = "some_base64"
-        file_content = json.dumps(self.license_data).encode("utf-8")
-        mock_open.return_value.__enter__.return_value.read.return_value = file_content
-
-        # mock the verify call => False
-        with patch("aepok_sentinel.core.license.verify_content_signature", return_value=False):
-            cfg = SentinelConfig(self.config_dict)
-            lm = LicenseManager(cfg)
-            lm.load_license()
-            self.assertFalse(is_license_valid(lm))
-            self.assertTrue(is_watch_only(lm))
-
-    @patch("os.path.isfile", return_value=False)
-    def test_file_not_found(self, mock_isfile):
-        """
-        If file not found => watch-only or raise if license_required
-        """
-        cfg1 = self.config_dict.copy()
-        cfg1["license_required"] = False
-        sc1 = SentinelConfig(cfg1)
-        lm1 = LicenseManager(sc1)
-        lm1.load_license()
-        self.assertTrue(is_watch_only(lm1))
-
-        cfg2 = self.config_dict.copy()
-        cfg2["license_required"] = True
-        sc2 = SentinelConfig(cfg2)
-        lm2 = LicenseManager(sc2)
-        with self.assertRaises(LicenseError):
-            lm2.load_license()
-
-    @patch("os.path.isfile", return_value=True)
-    @patch("builtins.open", create=True)
-    def test_bound_hardware_mismatch(self, mock_open, mock_isfile):
-        """
-        If bound_to != local fingerprint => degrade or fail if required
-        """
-        data_bound = {
+    @patch("aepok_sentinel.core.license.LicenseManager._verify_license_signature", return_value=True)
+    def test_hardware_bound_mismatch(self, mock_verify):
+        # turn on bound_to_hardware
+        self.cfg.raw_dict["bound_to_hardware"] = True
+        # re-init manager
+        self.manager = LicenseManager(self.cfg, audit_chain=self.audit_chain, sentinel_runtime_base=self.runtime_base)
+        lic_data = {
             "license_version": 1,
-            "issued_to": "BoundUser",
+            "license_uuid": "hw-001",
             "expires_on": "9999-12-31",
-            "signature": "validsig",  # We'll mock verify => True
-            "bound_to": "not_the_local_hash"
+            "signature": "somebase64",
+            "bound_to": "some_other_fp"
         }
-        file_content = json.dumps(data_bound).encode("utf-8")
-        mock_open.return_value.__enter__.return_value.read.return_value = file_content
+        with open(self.manager.license_path, "w", encoding="utf-8") as f:
+            json.dump(lic_data, f)
 
-        with patch("aepok_sentinel.core.license.verify_content_signature", return_value=True):
-            cfg_dict = self.config_dict.copy()
-            cfg_dict["license_required"] = False
-            cfg_dict["bound_to_hardware"] = True
-            cfg = SentinelConfig(cfg_dict)
-            lm = LicenseManager(cfg)
-            # We'll also patch compute_local_fingerprint to return something else
-            with patch("aepok_sentinel.core.license.LicenseManager._compute_local_fingerprint",
-                       return_value="some_other_hash"):
-                lm.load_license()
-                self.assertTrue(is_watch_only(lm))
-                self.assertFalse(is_license_valid(lm))
+        self.manager.load_license()
+        self.assertTrue(is_watch_only(self.manager))
+        evts = self._read_chain_events()
+        self.assertEqual(evts[0]["event"], "LICENSE_INVALID")
+        self.assertIn("hardware_mismatch", evts[0]["metadata"]["reason"])
 
-            # If license_required => raise
-            cfg2_dict = cfg_dict.copy()
-            cfg2_dict["license_required"] = True
-            cfg2 = SentinelConfig(cfg2_dict)
-            lm2 = LicenseManager(cfg2)
-            with patch("aepok_sentinel.core.license.LicenseManager._compute_local_fingerprint",
-                       return_value="some_other_hash"):
-                with self.assertRaises(LicenseError):
-                    lm2.load_license()
-
-    @patch("os.path.isfile", return_value=True)
-    @patch("builtins.open", create=True)
-    def test_valid_bound_hardware(self, mock_open, mock_isfile):
-        """
-        If bound_to matches local, not expired, sig verify => valid
-        """
-        data_bound = {
+    @patch("aepok_sentinel.core.license.LicenseManager._verify_license_signature", return_value=True)
+    def test_install_count_exceeded(self, mock_verify):
+        # turn on install counting
+        lic_data = {
             "license_version": 1,
-            "issued_to": "BoundUser",
+            "license_uuid": "install-limit-xyz",
             "expires_on": "9999-12-31",
-            "signature": "some_base64_sig",
-            "bound_to": "mock_fingerprint"
+            "signature": "somebase64",
+            "max_installs": 1
         }
-        file_content = json.dumps(data_bound).encode("utf-8")
-        mock_open.return_value.__enter__.return_value.read.return_value = file_content
+        with open(self.manager.license_path, "w", encoding="utf-8") as f:
+            json.dump(lic_data, f)
 
-        with patch("aepok_sentinel.core.license.verify_content_signature", return_value=True):
-            cfg_dict = self.config_dict.copy()
-            cfg_dict["license_required"] = True
-            cfg_dict["bound_to_hardware"] = True
-            cfg = SentinelConfig(cfg_dict)
-            lm = LicenseManager(cfg)
-            with patch("aepok_sentinel.core.license.LicenseManager._compute_local_fingerprint",
-                       return_value="mock_fingerprint"):
-                lm.load_license()
-                self.assertTrue(is_license_valid(lm))
-                self.assertFalse(is_watch_only(lm))
+        # first load => success => we used 1 install
+        self.manager.load_license()
+        self.assertTrue(is_license_valid(self.manager))
+        evts = self._read_chain_events()
+        self.assertEqual(evts[-1]["event"], "LICENSE_ACTIVATED")
+
+        # second load => same license => but we are a new 'host_fingerprint'?
+        with patch("aepok_sentinel.core.license_identity.read_host_identity",
+                   return_value={"fingerprint": "another_fp"}):
+            newmgr = LicenseManager(self.cfg, audit_chain=self.audit_chain, sentinel_runtime_base=self.runtime_base)
+            newmgr.load_license()
+            self.assertTrue(is_watch_only(newmgr))
+            # check event => INSTALL_REJECTED
+            evts2 = self._read_chain_events()
+            self.assertEqual(evts2[-1]["event"], "INSTALL_REJECTED")
+
+    def test_upload_license_ok(self):
+        # create a valid license
+        with open(self.manager.license_path, "w", encoding="utf-8") as f:
+            json.dump({"license_version":1, "signature":"base64", "expires_on":"9999-12-31"}, f)
+        # mock signature => True
+        with patch.object(self.manager, "_verify_license_signature", return_value=True):
+            self.manager.load_license()
+            self.assertTrue(is_license_valid(self.manager))
+
+            # now upload a new file that fails sig => degrade
+            bad_lic_path = os.path.join(self.temp_dir, "bad_lic.json")
+            with open(bad_lic_path, "w", encoding="utf-8") as bf:
+                json.dump({"license_version":1, "signature":"ZZZ", "expires_on":"9999-12-31"}, bf)
+
+            with patch.object(self.manager, "_verify_license_signature", return_value=False):
+                self.manager.upload_license(bad_lic_path)
+                self.assertTrue(is_watch_only(self.manager))
+
+        evts = self._read_chain_events()
+        # should have multiple events: LICENSE_ACTIVATED, then LICENSE_INVALID
+        evt_names = [e["event"] for e in evts]
+        self.assertIn("LICENSE_ACTIVATED", evt_names)
+        self.assertIn("LICENSE_INVALID", evt_names)
 
 
 if __name__ == "__main__":
