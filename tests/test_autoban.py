@@ -28,14 +28,13 @@ class TestAutobanManager(unittest.TestCase):
         self.temp_dir = tempfile.mkdtemp()
         self.blocklist_file = os.path.join(self.temp_dir, "blocked_ips.json")
         # create the directory if needed
-        # final shape => the directory is required to exist, so let's ensure it's there:
         os.makedirs(self.temp_dir, exist_ok=True)
 
         self.config_dict = {
             "schema_version": 1,
             "mode": "cloud",
             "autoban_enabled": True,
-            "autoban_block_ttl_days": 1  # 1 day
+            "autoban_block_ttl_days": 1
         }
         self.cfg = SentinelConfig(self.config_dict)
         self.license_mgr = LicenseManager(self.cfg)
@@ -84,7 +83,7 @@ class TestAutobanManager(unittest.TestCase):
         self.assertFalse(self.ab.is_blocked("2.3.4.5"))
 
     def test_block_ttl_expired(self):
-        # manually add an IP w/ an old blocked_on
+        # manually add a source w/ an old blocked_on
         old_ts = int(time.time()) - (2*86400)  # 2 days ago
         self.ab.blocked_data["10.0.0.1"] = {"blocked_on": str(old_ts)}
         # save
@@ -93,8 +92,8 @@ class TestAutobanManager(unittest.TestCase):
         # re-init manager => should purge
         with patch.object(self.ab, "enforce_unblock") as mock_unblock:
             new_ab = AutobanManager(
-                config=self.cfg, 
-                license_mgr=self.license_mgr, 
+                config=self.cfg,
+                license_mgr=self.license_mgr,
                 audit_chain=self.audit_chain,
                 blocklist_file=self.blocklist_file
             )
@@ -112,7 +111,6 @@ class TestAutobanManager(unittest.TestCase):
 
     @patch("aepok_sentinel.core.autoban.AutobanManager._verify_binary_trusted", return_value=False)
     def test_untrusted_binary(self, mock_trusted):
-        # if firewall binary is untrusted => error
         with self.assertRaises(AutobanError):
             self.ab.record_bad_source("11.22.33.44", "untrusted")
 
