@@ -1,14 +1,14 @@
 """
 autoban.py
 
-Final-shape Autoban IP Enforcement:
- - On suspicious or malicious events from an IP, we can block that IP at the firewall level.
+Final-shape Autoban Source Enforcement:
+ - On suspicious or malicious events from a given source, we can block that source at the firewall level.
  - We verify the firewall binaries' paths + hashes before running them (flaw #30).
  - We store a signed JSON blocklist on disk (flaw #31), verifying upon load so it cannot be tampered with silently.
- - We support an IP block TTL (autoban_block_ttl_days) so that blocks expire after some days (flaw #32).
+ - We support a block TTL (autoban_block_ttl_days) so that blocks expire after some days (flaw #32).
  - We never create directories automatically; if the directory for blocklist_file is missing, we fail.
 
-No references to ephemeral placeholders or partial "step" logic. 
+No references to ephemeral placeholders or partial "step" logic.
 """
 
 import os
@@ -39,12 +39,12 @@ class AutobanError(Exception):
 
 class AutobanManager:
     """
-    Manages IP autoban logic:
-      - Maintains a set of blocked IPs in memory
+    Manages source autoban logic:
+      - Maintains a set of blocked sources in memory
       - Persists them in a JSON + signature to disk
       - Enforces real firewall rules after verifying the firewall binary's trust
       - Honors watch-only => no real block
-      - Expires IP blocks after config["autoban_block_ttl_days"] days
+      - Expires blocks after config["autoban_block_ttl_days"] days
     """
 
     def __init__(
@@ -71,55 +71,54 @@ class AutobanManager:
 
         # load blocklist + signature
         self.blocked_data: Dict[str, Dict[str, str]] = {}
-        # each IP => { "blocked_on": <timestamp>, ... }
+        # each source => { "blocked_on": <timestamp>, ... }
         self._load_blocklist()
 
-    def record_bad_source(self, ip: str, reason: str) -> None:
+    def record_bad_source(self, identifier: str, reason: str) -> None:
         """
-        Called upon suspicious event from IP.
+        Called upon suspicious event from a source.
         - If not autoban_enabled => do nothing (just info).
         - If watch_only => log to chain as SOURCE_BLOCKED but skip firewall changes.
         - If not blocked => firewall block => chain event => "AUTOBAN_TRIGGERED".
         """
         if not self.autoban_enabled:
-            logger.info("Autoban disabled => skip blocking IP=%s reason=%s", ip, reason)
+            logger.info("Autoban disabled => skip blocking source=%s reason=%s", identifier, reason)
             return
 
         self._purge_expired()  # ensure we purge old blocks if any
 
-        if ip in self.blocked_data:
-            logger.debug("IP %s already blocked, skipping repeat block. reason=%s", ip, reason)
+        if identifier in self.blocked_data:
+            logger.debug("Source %s already blocked, skipping repeat block. reason=%s", identifier, reason)
             return
 
         # watch-only => no real block
         if is_watch_only(self.license_mgr):
-            self._append_chain_event(EventCode.SOURCE_BLOCKED, {"ip": ip, "reason": reason, "action": "watch-only"})
+            self._append_chain_event(EventCode.SOURCE_BLOCKED, {"source": identifier, "reason": reason, "action": "watch-only"})
             return
 
         # normal path => enforce block
         try:
-            self.enforce_block(ip)
-            # track in memory
-            self.blocked_data[ip] = {"blocked_on": str(int(time.time()))}
+            self.enforce_block(identifier)
+            self.blocked_data[identifier] = {"blocked_on": str(int(time.time()))}
             self._save_blocklist()
             self._append_chain_event(
                 EventCode.AUTOBAN_TRIGGERED,
-                {"ip": ip, "reason": reason, "firewall_action": "blocked"}
+                {"source": identifier, "reason": reason, "firewall_action": "blocked"}
             )
         except Exception as e:
-            logger.error("Failed to block IP %s: %s", ip, e)
-            raise AutobanError(f"Failed to block IP {ip}: {e}")
+            logger.error("Failed to block source %s: %s", identifier, e)
+            raise AutobanError(f"Failed to block source {identifier}: {e}")
 
-    def is_blocked(self, ip: str) -> bool:
+    def is_blocked(self, identifier: str) -> bool:
         """
-        Checks if IP is in blocklist. If TTL is set and IP is expired => unblock + remove it.
+        Checks if source is in blocklist. If TTL is set and source is expired => unblock + remove it.
         """
         self._purge_expired()
-        return ip in self.blocked_data
+        return identifier in self.blocked_data
 
-    def enforce_block(self, ip: str) -> None:
+    def enforce_block(self, identifier: str) -> None:
         """
-        Issues a firewall command after verifying the binary is trusted. 
+        Issues a firewall command after verifying the binary is trusted.
         Platform logic:
          - Linux => try 'ufw' or 'iptables'
          - Windows => 'netsh advfirewall'
@@ -134,7 +133,6 @@ class AutobanManager:
         elif platform.startswith("win"):
             candidates = ["netsh"]
         elif platform.startswith("darwin"):
-            # we try ipfw or something
             candidates = ["ipfw", "pfctl"]
         else:
             raise AutobanError(f"Unsupported platform '{platform}' for firewall block.")
@@ -149,8 +147,7 @@ class AutobanManager:
         if not cmd_path:
             raise AutobanError(f"No trusted firewall binary found among {candidates} on platform={platform}")
 
-        # Now build the actual command
-        cmd_args = self._build_firewall_command_args(platform, cmd_path, ip)
+        cmd_args = self._build_firewall_command_args(platform, cmd_path, identifier)
         logger.info("Executing firewall block command: %s", " ".join(cmd_args))
         try:
             completed = subprocess.run(cmd_args, capture_output=True, text=True, check=False)
@@ -171,7 +168,6 @@ class AutobanManager:
             logger.warning("Blocklist signature file missing => ignoring blocklist for safety.")
             return
 
-        # read the files
         try:
             with open(self.blocklist_file, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -181,19 +177,13 @@ class AutobanManager:
             logger.warning("Failed to read blocklist or signature: %s", e)
             return
 
-        # verify signature
-        # we assume we have our local Dilithium private key => we can get a public key if needed
-        # or we treat the private key as a sign/verify (or a separate pub key). 
-        # We'll do a naive approach: no separate pub => treat our private as sign+verify in yoy yoy yoy
-        # Real usage => store public key or keep separate
         try:
             with open(self.sign_priv_key_path, "rb") as kf:
-                dil_priv = kf.read()  # for demonstration, we do same key for sign+verify
+                dil_priv = kf.read()
         except Exception as e:
             logger.warning("Missing or unreadable Dilithium key for blocklist verification: %s", e)
             return
 
-        # parse the signature => we used sign_content_bundle => base64 => let's do an approach
         import base64
         import json as j
         try:
@@ -209,22 +199,17 @@ class AutobanManager:
             logger.warning("Blocklist signature invalid => ignoring blocklist.")
             return
 
-        # now parse the content
         try:
             data = json.loads(content)
             if not isinstance(data, dict):
-                raise ValueError("blocklist content must be a dict { ip: { ... } }")
+                raise ValueError("blocklist content must be a dict { source: { ... } }")
             self.blocked_data = data
-            logger.info("Loaded %d blocked IP entries from disk (signed).", len(self.blocked_data))
+            logger.info("Loaded %d blocked source entries from disk (signed).", len(self.blocked_data))
         except Exception as e:
             logger.warning("Failed to parse blocklist JSON: %s", e)
 
     def _save_blocklist(self) -> None:
-        """
-        Saves self.blocked_data to disk + signature with local Dilithium key
-        """
         try:
-            # check directory
             dir_path = os.path.dirname(self.blocklist_file)
             if not os.path.isdir(dir_path):
                 raise RuntimeError(f"Blocklist directory missing: {dir_path}")
@@ -233,7 +218,6 @@ class AutobanManager:
             with open(self.blocklist_file, "w", encoding="utf-8") as f:
                 f.write(content_str)
 
-            # sign
             with open(self.sign_priv_key_path, "rb") as kf:
                 dil_priv = kf.read()
 
@@ -254,69 +238,62 @@ class AutobanManager:
     # -----------------------------------------------
     def _purge_expired(self) -> None:
         """
-        If self.ttl_days > 0 => remove any IP blocked older than that TTL. 
+        If self.ttl_days > 0 => remove any source blocked older than that TTL.
         Also enforce_unblock(...) if so desired. For final shape, let's do it.
         """
         if self.ttl_days <= 0:
             return
 
         now_ts = int(time.time())
-        expired_ips = []
-        for ip, meta in self.blocked_data.items():
+        expired_sources = []
+        for identifier, meta in self.blocked_data.items():
             blocked_on = int(meta.get("blocked_on", "0"))
             if blocked_on <= 0:
                 continue
             dt = now_ts - blocked_on
             if dt > (self.ttl_days * 86400):
-                expired_ips.append(ip)
+                expired_sources.append(identifier)
 
-        if not expired_ips:
+        if not expired_sources:
             return
 
-        logger.info("Purging %d expired IP blocks (TTL=%d days).", len(expired_ips), self.ttl_days)
-        for ip in expired_ips:
+        logger.info("Purging %d expired source blocks (TTL=%d days).", len(expired_sources), self.ttl_days)
+        for identifier in expired_sources:
             try:
-                self.enforce_unblock(ip)
+                self.enforce_unblock(identifier)
             except Exception as e:
-                logger.warning("Failed to unblock IP %s during purge: %s", ip, e)
-            self.blocked_data.pop(ip, None)
+                logger.warning("Failed to unblock source %s during purge: %s", identifier, e)
+            self.blocked_data.pop(identifier, None)
 
         self._save_blocklist()
 
-    def enforce_unblock(self, ip: str) -> None:
+    def enforce_unblock(self, identifier: str) -> None:
         """
-        Removes the firewall rule blocking 'ip'. For demonstration, 
-        we try to reverse the commands from enforce_block. 
+        Removes the firewall rule blocking 'identifier'. For demonstration,
+        we try to reverse the commands from enforce_block.
         This might be non-trivial on each platform. We do a best effort.
         If we can't remove => we log a warning or error.
         """
         platform = sys.platform
         if platform.startswith("linux"):
-            # if we used ufw => ufw delete deny from <ip>
-            # if we used iptables => iptables -D INPUT -s <ip> -j DROP
-            # We'll just guess. This is obviously an approximation.
             ufw_path = which("ufw")
             ipt_path = which("iptables")
             if ufw_path and self._verify_binary_trusted(ufw_path):
-                cmd = [ufw_path, "delete", "deny", "from", ip]
+                cmd = [ufw_path, "delete", "deny", "from", identifier]
             elif ipt_path and self._verify_binary_trusted(ipt_path):
-                cmd = [ipt_path, "-D", "INPUT", "-s", ip, "-j", "DROP"]
+                cmd = [ipt_path, "-D", "INPUT", "-s", identifier, "-j", "DROP"]
             else:
                 raise AutobanError("No valid or trusted firewall binary for unblocking on Linux.")
         elif platform.startswith("win"):
-            # netsh advfirewall firewall delete rule name="SentinelBlock <ip>"
-            cmd = ["netsh", "advfirewall", "firewall", "delete", "rule", f'name=SentinelBlock {ip}']
+            cmd = ["netsh", "advfirewall", "firewall", "delete", "rule", f'name=SentinelBlock {identifier}']
         elif platform.startswith("darwin"):
-            # we do the rough inverse of ipfw => ipfw delete <id> 
-            # but we don't store the rule ID. For final shape, we do a partial approach
-            # 'ipfw delete deny ip from <ip> to any' might or might not work
             ipfw_path = which("ipfw")
             if ipfw_path and self._verify_binary_trusted(ipfw_path):
-                cmd = [ipfw_path, "delete", "deny", "ip", "from", ip, "to", "any"]
+                cmd = [ipfw_path, "delete", "deny", "ip", "from", identifier, "to", "any"]
             else:
                 raise AutobanError("No valid/trusted binary on macOS for unblocking.")
         else:
-            raise AutobanError(f"Unsupported platform '{platform}' for unblocking IP.")
+            raise AutobanError(f"Unsupported platform '{platform}' for unblocking source.")
 
         logger.info("Executing firewall unblock command: %s", " ".join(cmd))
         completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -326,52 +303,42 @@ class AutobanManager:
     # -----------------------------------------------
     # Helpers
     # -----------------------------------------------
-    def _build_firewall_command_args(self, platform: str, cmd_path: str, ip: str) -> list:
+    def _build_firewall_command_args(self, platform: str, cmd_path: str, identifier: str) -> list:
         """
-        Based on platform + cmd_path, construct the final command list for blocking 'ip'.
+        Based on platform + cmd_path, construct the final command list for blocking 'identifier'.
         """
         if platform.startswith("linux"):
             if os.path.basename(cmd_path) == "ufw":
-                return [cmd_path, "deny", "from", ip]
+                return [cmd_path, "deny", "from", identifier]
             else:
-                # iptables
-                return [cmd_path, "-I", "INPUT", "-s", ip, "-j", "DROP"]
+                return [cmd_path, "-I", "INPUT", "-s", identifier, "-j", "DROP"]
         elif platform.startswith("win"):
-            # netsh approach
             return [
                 cmd_path, "advfirewall", "firewall", "add", "rule",
-                f"name=SentinelBlock {ip}",
-                "dir=in", "interface=any", "action=block", f"remoteip={ip}"
+                f"name=SentinelBlock {identifier}",
+                "dir=in", "interface=any", "action=block", f"remoteip={identifier}"
             ]
         elif platform.startswith("darwin"):
-            # ipfw or pfctl
             if os.path.basename(cmd_path) == "ipfw":
-                return [cmd_path, "add", "deny", "ip", "from", ip, "to", "any"]
+                return [cmd_path, "add", "deny", "ip", "from", identifier, "to", "any"]
             else:
-                # pfctl approach => more advanced. We'll do a quick fallback
-                return [cmd_path, "-f", f"block drop from {ip} to any"]  # demonstration
+                return [cmd_path, "-f", f"block drop from {identifier} to any"]
         else:
             raise AutobanError(f"Unsupported platform '{platform}'")
 
     def _verify_binary_trusted(self, bin_path: str) -> bool:
         """
-        Checks if bin_path's sha256 matches a known list of trusted firewall binaries, 
+        Checks if bin_path's sha256 matches a known list of trusted firewall binaries,
         so we don't run a tampered one.
-        For demonstration, we store a small dict or we skip if empty.
+        For demonstration, we store these in a local dictionary. If empty => raise AutobanError.
         """
-        # Example 'trusted_binaries' map: { "/usr/sbin/ufw": "<sha256>", ... }
-        # In real usage, we might store these in a secure location or config.
-        # We'll do a minimal approach with an empty set => e.g., skip or trust all => but let's show a sample:
-
         trusted_binaries = {
             # e.g. "/usr/sbin/ufw": "abc123sha256..."
-            # "/usr/bin/iptables": "deadbeef..."
         }
 
         if not trusted_binaries:
             raise AutobanError("No trusted firewall binaries defined. Enforcement is not secure.")
 
-        # compute hash
         try:
             with open(bin_path, "rb") as bf:
                 data = bf.read()
@@ -392,9 +359,6 @@ class AutobanManager:
         return True
 
     def _append_chain_event(self, event_code: EventCode, metadata: dict) -> None:
-        """
-        Logs an event to the audit chain with relevant data.
-        """
         try:
             self.audit_chain.append_event(event_code.value, metadata)
         except Exception as e:
