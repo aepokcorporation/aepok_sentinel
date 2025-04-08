@@ -403,7 +403,7 @@ class LicenseManager:
                     f.write(content_str)
 
                 # Sign it
-                priv_path = resolve_path("keys", "vendor_dilithium_priv.pem")
+                priv_path = resolve_path("keys", "vendor_dilithium_priv.bin")
                 with open(priv_path, "rb") as kf:
                     vendor_dil = kf.read()
 
