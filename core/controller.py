@@ -181,6 +181,21 @@ class SentinelController:
         self.stop()
         self.boot()
 
+    def anchor_now(self) -> None:
+        """
+        CLI/GUI-callable: manually triggers audit anchor submission.
+        """
+        if self.audit_chain:
+            self.audit_chain.trigger_anchor_now()
+
+    def get_anchor_status(self) -> Dict[str, Any]:
+        """
+        CLI/GUI-callable: returns current Merkle root + latest checkpoint file.
+        """
+        if self.audit_chain:
+            return self.audit_chain.get_current_root_info()
+        return {}
+
     # ------------------- Private Additions (Signature Checks) -------------------
 
     def _load_config_with_signature(self) -> None:
