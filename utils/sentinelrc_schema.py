@@ -60,6 +60,7 @@ DEFAULTS = {
     "use_inotify": True,
     "tls_mode": "hybrid",     # [pqc-only, hybrid, classical]
     "allow_unknown_keys": False
+    "anchor_export_path": "",
 }
 
 
