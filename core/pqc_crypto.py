@@ -278,6 +278,19 @@ def decrypt_file_payload(
                     label=None
                 )
             )
+
+            # NEW: Log RSA fallback usage to audit chain
+            try:
+                from aepok_sentinel.core.audit_chain import append_event
+                append_event("SIGNATURE_RSA_USED", {
+                    "reason": "Kyber decapsulation failed, RSA fallback accepted",
+                    "enforcement_mode": config.enforcement_mode,
+                    "strict_transport": config.strict_transport,
+                    "tls_mode": config.tls_mode,
+                })
+            except Exception:
+                logger.warning("Failed to emit SIGNATURE_RSA_USED audit event.")
+
         except Exception as e:
             msg = f"RSA fallback also failed => {e}"
             logger.error(msg)
