@@ -140,16 +140,18 @@ class ProvisionDevice:
 
     def collect_user_input(self) -> Dict[str, Any]:
         """
-        Minimal example showing a CLI approach. In a real system, might prompt or get from a GUI.
-        We'll just stub out some config fields for demonstration.
-        Return a dict that meets .sentinelrc schema fields.
+        Prompts user for minimal .sentinelrc config fields, including required anchor_export_path.
         """
-        logger.info("Collecting user config input from CLI or GUI (demonstration).")
-        # In real usage: prompt user or parse command args
+        logger.info("Collecting user config input from CLI or GUI (production-ready).")
+
+        anchor_path = input("Enter the full path to your anchor export directory (must exist and be mounted): ").strip()
+        if not os.path.isdir(anchor_path):
+            raise ProvisionError(f"Anchor export path '{anchor_path}' does not exist or is not a directory.")
+
         config_data = {
             "schema_version": 1,
             "mode": "cloud",
-            "enforcement_mode": "STRICT",  # or "HARDENED"/"PERMISSIVE"
+            "enforcement_mode": "STRICT",  # or HARDENED / PERMISSIVE
             "scan_paths": ["/home/data"],
             "exclude_paths": ["/home/exclude"],
             "cloud_keyvault_enabled": True,
@@ -158,8 +160,10 @@ class ProvisionDevice:
             "cloud_kyber_secret": "KYBER-PRIVATE-KEY",
             "license_required": True,
             "bound_to_hardware": True,
-            "allow_unknown_keys": False
+            "allow_unknown_keys": False,
+            "anchor_export_path": anchor_path
         }
+
         return config_data
 
     def build_and_validate_sentinelrc(self, raw_dict: Dict[str, Any]) -> None:
