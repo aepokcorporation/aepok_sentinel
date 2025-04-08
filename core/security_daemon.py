@@ -78,8 +78,11 @@ class SecurityDaemon:
         # load or create .hashes.json with signature
         self._hash_store = {}
         self._previous_hashes: Dict[str, list] = {}  # e.g. { filepath: [list_of_past_hashes] }
-
+        self._hash_seen_table: Dict[str, Dict[str, Any]] = {}  # SHA256 → { "count": N, "first_seen": str, "paths": set }
+                
         self._load_hash_store()
+        
+        self._initialize_hash_seen_table()
 
         # load malware DB
         self.malware_db = MalwareDatabase(config)
@@ -93,6 +96,22 @@ class SecurityDaemon:
 
         self._use_inotify = bool(self.config.raw_dict.get("use_inotify", False))
         self._poll_interval = int(self.config.daemon_poll_interval)
+
+    def _initialize_hash_seen_table(self) -> None:
+        """
+        Populate _hash_seen_table from current _hash_store on startup.
+        """
+        now = datetime.datetime.utcnow().isoformat() + "Z"
+        for path, hval in self._hash_store.items():
+            if hval not in self._hash_seen_table:
+                self._hash_seen_table[hval] = {
+                    "count": 1,
+                    "first_seen": now,
+                    "paths": set([path])
+                }
+            else:
+                self._hash_seen_table[hval]["count"] += 1
+                self._hash_seen_table[hval]["paths"].add(path)
 
     def start(self) -> None:
         """
@@ -327,6 +346,30 @@ class SecurityDaemon:
                 self._previous_hashes[filepath].append(old_hash)
 
         self._hash_store[filepath] = new_hash
+
+        # Update global seen table
+        now = datetime.datetime.utcnow().isoformat() + "Z"
+        seen_entry = self._hash_seen_table.get(new_hash)
+        if seen_entry:
+            seen_entry["count"] += 1
+            seen_entry["paths"].add(filepath)
+
+            # If new path seen with same hash => potential replay reuse
+            if filepath not in seen_entry["paths"]:
+                self._log_chain_event("REPLAY_REUSE_DETECTED", {
+                    "sha256": new_hash,
+                    "new_path": filepath,
+                    "known_paths": list(seen_entry["paths"]),
+                    "first_seen": seen_entry["first_seen"],
+                    "seen_count": seen_entry["count"]
+                })
+        else:
+            self._hash_seen_table[new_hash] = {
+                "count": 1,
+                "first_seen": now,
+                "paths": set([filepath])
+            }
+
         self._save_hash_store()
 
     # ------------------------------------------
