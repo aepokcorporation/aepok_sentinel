@@ -232,7 +232,13 @@ def decrypt_file_payload(
     iv = base64.b64decode(b64_iv)
 
     wrapped_rsa = base64.b64decode(payload.get("wrapped_key_rsa", "")) if payload.get("wrapped_key_rsa") else b""
-    auth_tag = base64.b64decode(payload["auth_tag"]) if payload.get("auth_tag") else None
+    
+    try:
+        auth_tag = base64.b64decode(payload["auth_tag"]) if payload.get("auth_tag") else None
+    except Exception as e:
+        logger.warning("auth_tag decode failed: %s", e)
+        raise CryptoDecryptionError(f"GCM tag parse error: {e}")
+    
     integrity_hex = payload.get("integrity", "")
 
     aes_key = b""
@@ -294,7 +300,13 @@ def decrypt_file_payload(
             # CBC + HMAC
             if not integrity_hex:
                 raise CryptoDecryptionError("CBC+HMAC mode but no 'integrity' field in payload.")
-            expected_hmac = bytes.fromhex(integrity_hex)
+            
+            try:
+                expected_hmac = bytes.fromhex(integrity_hex)
+            except Exception as e:
+                logger.warning("HMAC integrity hex malformed: %s", e)
+                raise CryptoDecryptionError(f"Malformed integrity hex in payload: {e}")
+    
             h = hmac.HMAC(aes_key, hashes.SHA512(), backend=default_backend())
             h.update(ciphertext)
             h.verify(expected_hmac)
