@@ -229,8 +229,21 @@ def load_config(parse_env: bool = True) -> SentinelConfig:
     # Build config object
     cfg = SentinelConfig(validated_data)
 
+    # Emit CONFIG_SIGNATURE_INVALID or CONFIG_REJECTED if signature failed and we're in strict/scif/hardened
+    if validated_data.get("_signature_verified") is False:
+        if cfg.mode == "scif" or cfg.enforcement_mode in ("STRICT", "HARDENED"):
+            try:
+                audit_chain.append_event("CONFIG_REJECTED", {
+                    "reason": "signature_verification_failed",
+                    "mode": cfg.mode,
+                    "enforcement_mode": cfg.enforcement_mode
+                })
+            except Exception:
+                pass  # Do not block boot on audit chain issues
+
     # If parse_env=True but the mode is not scif and enforcement is not STRICT,
     # we allow a small whitelist of environment overrides. Otherwise, ignore them.
+
     if parse_env:
         # If scif or STRICT => ignore env overrides
         if not (cfg.mode == "scif" or cfg.enforcement_mode == "STRICT"):
