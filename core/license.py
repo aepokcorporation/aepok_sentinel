@@ -341,9 +341,8 @@ class LicenseManager:
 
     def _load_install_state(self) -> Dict[str, Dict[str, Any]]:
         """
-        Reads install_state.json => { license_uuid: { "known_installs":[], "install_count":N }, ... }
-        If missing => return {}
-        If scif/hardened => error on missing or invalid
+        Reads install_state.json and verifies its signature.
+        Returns parsed dict or raises if invalid in strict/hardened.
         """
         if not os.path.isfile(self.install_state_path):
             if self._must_fail():
@@ -351,30 +350,72 @@ class LicenseManager:
             logger.warning("install_state.json missing => starting fresh usage state.")
             return {}
 
-        try:
-            with open(self.install_state_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                raise ValueError("Not a dict")
-            return data
-        except Exception as e:
-            msg = f"Failed to load install_state.json => {e}"
+        sig_path = self.install_state_path + ".sig"
+        if not os.path.isfile(sig_path):
+            msg = f"install_state.json.sig missing => cannot verify."
             logger.warning(msg)
             if self._must_fail():
                 raise InstallStateError(msg)
             return {}
 
-    def _save_install_state(self) -> None:
-        """
-        Writes self.install_state. No auto creation => directory must exist.
-        """
         try:
-            with open(self.install_state_path, "w", encoding="utf-8") as f:
-                json.dump(self.install_state, f, indent=2)
+            with open(self.install_state_path, "r", encoding="utf-8") as f:
+                content_str = f.read()
+            with open(sig_path, "rb") as sf:
+                sig_bytes = sf.read()
+
+            import base64, json as j
+            sig_dict = j.loads(base64.b64decode(sig_bytes).decode("utf-8"))
+
+            pub_path = resolve_path(os.path.join(self.runtime_base, "keys", "vendor_dilithium_pub.pem"))
+            with open(pub_path, "rb") as pf:
+                vendor_dil_pub = pf.read()
+
+            if not verify_content_signature(content_str.encode("utf-8"), sig_dict, self.config, vendor_dil_pub, None):
+                msg = "install_state signature invalid => rejecting load."
+                logger.warning(msg)
+                if self._must_fail():
+                    raise InstallStateError(msg)
+                return {}
+
+            data = json.loads(content_str)
+            if not isinstance(data, dict):
+                raise ValueError("install_state.json is not a dict.")
+            return data
         except Exception as e:
-            logger.warning("Failed to save install_state.json => %s", e)
+            msg = f"Failed to load or verify install_state.json => {e}"
+            logger.warning(msg)
             if self._must_fail():
-                raise InstallStateError(str(e))
+                raise InstallStateError(msg)
+            return {}
+
+        def _save_install_state(self) -> None:
+            """
+            Writes self.install_state and a signature using vendor_dilithium_priv.bin.
+            """
+            try:
+                content_str = json.dumps(self.install_state, indent=2)
+
+                with open(self.install_state_path, "w", encoding="utf-8") as f:
+                    f.write(content_str)
+
+                # Sign it
+                priv_path = resolve_path(os.path.join(self.runtime_base, "keys", "vendor_dilithium_priv.bin"))
+                with open(priv_path, "rb") as kf:
+                    vendor_dil = kf.read()
+
+                sig_bundle = sign_content_bundle(content_str.encode("utf-8"), self.config, vendor_dil, None)
+
+                import base64, json as j
+                sig_b64 = base64.b64encode(j.dumps(sig_bundle).encode("utf-8"))
+
+                with open(self.install_state_path + ".sig", "wb") as sf:
+                    sf.write(sig_b64)
+
+            except Exception as e:
+                logger.warning("Failed to save or sign install_state.json: %s", e)
+                if self._must_fail():
+                    raise InstallStateError(str(e))
 
     def _chain_event(self, event_code: EventCode, metadata: dict) -> None:
         if not self.audit_chain:
