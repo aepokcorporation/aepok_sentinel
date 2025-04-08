@@ -594,6 +594,24 @@ class AuditChain:
             finally:
                 _unlock_file(cf)
         return hashlib.sha512(content.encode("utf-8")).hexdigest()
+      
+        def get_current_root_info(self) -> Dict[str, Any]:
+            """
+            Returns current Merkle root and latest checkpoint filename.
+            Used by CLI/GUI for anchor status panels.
+            """
+            current_root = self._get_current_merkle_root()
+
+            checkpoint_files = sorted(
+                [f for f in os.listdir(self.audit_dir) if f.startswith("chain_checkpoint_") and f.endswith(".json")],
+                reverse=True
+            )
+            latest_checkpoint = checkpoint_files[0] if checkpoint_files else None
+
+            return {
+                "merkle_root": current_root,
+                "latest_checkpoint": latest_checkpoint
+            }
 
     # -----------------------------------------------------------------
     # Helpers for internal Merkle logic
