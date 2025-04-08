@@ -455,7 +455,27 @@ class SentinelController:
 
     def _init_audit_chain(self) -> None:
         chain_path = self.chain_dir or self.config.raw_dict.get("log_path", "/var/log/sentinel/")
-        self.audit_chain = AuditChain(chain_dir=chain_path)
+
+        self.audit_chain = AuditChain(
+            pqc_priv_keys={
+                "dilithium": self.key_manager.fetch_current_keys().get("dilithium_priv"),
+                "rsa": self.key_manager.fetch_current_keys().get("rsa_priv")
+            },
+            pqc_pub_keys={
+                "dilithium": None,  # not used for export/append, only for validation if needed
+                "rsa": None
+            },
+            max_size_bytes=100 * 1024 * 1024,
+            background_verification_interval=0,
+            anchor_config={
+                "anchor_export_path": self.config.raw_dict.get("anchor_export_path"),
+                "enforcement_mode": self.config.enforcement_mode,
+                "host_fingerprint": self._host_fingerprint,
+                "license_uuid": self._license_uuid
+            },
+            chain_dir=chain_path
+        )
+
         try:
             self.audit_chain.validate_chain()
         except Exception as e:
