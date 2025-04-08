@@ -69,13 +69,13 @@ class ProvisionDevice:
         """
         self.runtime_base = runtime_base
         self.audit_chain = audit_chain
-        self._provision_flag_path = resolve_path(runtime_base, "provisioning_complete.flag")
-        self._sentinelrc_path = resolve_path(runtime_base, "config/.sentinelrc")
-        self._license_path = resolve_path(runtime_base, "license/license.key")
-        self._identity_path = resolve_path(runtime_base, "identity.json")
-        self._trust_anchor_path = resolve_path(runtime_base, "trust_anchor.json")
-        self._keys_dir = resolve_path(runtime_base, "keys")
-        self._installer_key_path = resolve_path(runtime_base, "keys/installer_dilithium_priv.bin")
+        self._provision_flag_path = resolve_path("provisioning_complete.flag")
+        self._sentinelrc_path = resolve_path("config", ".sentinelrc")
+        self._license_path = resolve_path("license", "license.key")
+        self._identity_path = resolve_path("config", "identity.json")
+        self._trust_anchor_path = resolve_path("config", "trust_anchor.json")
+        self._keys_dir = resolve_path("keys")
+        self._installer_key_path = resolve_path("keys", "installer_dilithium_priv.bin")
 
         self._vendor_dil_priv = b""   # store device's new vendor_dil private key
         self._vendor_dil_pub = b""    # store device's vendor_dil public key
@@ -302,8 +302,8 @@ class ProvisionDevice:
                 vendor_priv = sig.export_secret_key()
                 vendor_pub = sig.export_public_key()
 
-            priv_path = os.path.join(self._keys_dir, "vendor_dilithium_priv.bin")
-            pub_path = os.path.join(self._keys_dir, "vendor_dilithium_pub.pem")
+            priv_path = resolve_path("keys", "vendor_dilithium_priv.bin")
+            pub_path = resolve_path("keys", "vendor_dilithium_pub.pem")
 
             with open(priv_path, "wb") as f:
                 f.write(vendor_priv)
@@ -352,21 +352,14 @@ class ProvisionDevice:
             self._license_path,
             self._identity_path,
             self._trust_anchor_path,  # self reference => partial
-            os.path.join(self._keys_dir, "vendor_dilithium_priv.bin"),
-            os.path.join(self._keys_dir, "vendor_dilithium_pub.pem"),
+            resolve_path("keys", "vendor_dilithium_priv.bin"),
+            resolve_path("keys", "vendor_dilithium_pub.pem"),
         ]
         # Also gather any keys from KeyManager (kyber, rsa, etc.)
         for f in os.listdir(self._keys_dir):
-            fullp = os.path.join(self._keys_dir, f)
+            fullp = resolve_path("keys", "f")
             if os.path.isfile(fullp) and fullp not in file_list:
                 file_list.append(fullp)
-
-        # Possibly add code modules. We'll do a small demonstration
-        code_modules = ["controller.py", "license.py", "security_daemon.py"]
-        for mod in code_modules:
-            possible = os.path.join(self.runtime_base, mod)
-            if os.path.isfile(possible):
-                file_list.append(possible)
 
         # Hash them
         anchor_obj = {"version": 1, "created_utc": self._utc_now(), "hashes": {}}
