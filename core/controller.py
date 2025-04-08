@@ -281,8 +281,8 @@ class SentinelController:
         If fail => if must_fail => raise
         """
         # trust_anchor.json
-        anchor_path = os.path.join(self.sentinel_runtime_base, "trust_anchor.json")
-        anchor_sig = anchor_path + ".sig"
+        anchor_path = resolve_path("config", "trust_anchor.json")
+        anchor_sig = resolve_path("config", "trust_anchor.json.sig")
         self._verify_file_signature(anchor_path, anchor_sig, desc="trust_anchor.json")
 
         # parse trust_anchor.json for known pubkey hashes
@@ -296,7 +296,7 @@ class SentinelController:
             return
 
         # check vendor_dilithium_pub.pem
-        vend_pub_path = os.path.join(self.sentinel_runtime_base, "vendor_dilithium_pub.pem")
+        vend_pub_path = resolve_path("keys", "vendor_dilithium_pub.pem")
         vend_pub_hash_expected = anchor_obj.get("vendor_dil_pub_sha256")
         if vend_pub_hash_expected:
             try:
@@ -312,7 +312,7 @@ class SentinelController:
                 raise ControllerError(msg)
         
         # check sentinelrc_dilithium_pub.pem
-        sentinelrc_pub_path = os.path.join(self.sentinel_runtime_base, "sentinelrc_dilithium_pub.pem"
+        sentinelrc_pub_path = resolve_path("keys", "sentinelrc_dilithium_pub.pem")
         sentinelrc_pub_hash_expected = anchor_obj.get("sentinelrc_pub_sha256")
         if sentinelrc_pub_hash_expected:
             try:
@@ -325,8 +325,8 @@ class SentinelController:
             logger.warning("trust_anchor.json missing 'sentinelrc_pub_sha256' => cannot bind sentinelrc_dilithium_pub.pem")
 
         # identity.json
-        identity_path = os.path.join(self.sentinel_runtime_base, "identity.json")
-        identity_sig = identity_path + ".sig"
+        identity_path = resolve_path("config", "identity.json")
+        identity_sig = resolve_path("config", "identity.json.sig")
         self._verify_file_signature(identity_path, identity_sig, desc="identity.json")
 
     def _verify_file_signature(self, file_path: str, sig_path: str, desc: str) -> None:
@@ -371,10 +371,8 @@ class SentinelController:
             return
 
         data_bytes = file_str.encode("utf-8")
-        # For final shape, we might get the correct pub from trust_anchor or built-in. 
-        # If it's "trust_anchor.json", we say "FAKE_VENDOR_PUB", else identity => "FAKE_IDENTITY_PUB"
-        # or we could unify. We'll keep the logic from last time:
-        sentinel_pub = b"FAKE_VENDOR_PUB" if "trust_anchor" in desc else b"FAKE_IDENTITY_PUB"
+        with open(resolve_path("keys", "vendor_dilithium_pub.pem"), "rb") as f:
+            sentinel_pub = f.read()
 
         ok = verify_content_signature(data_bytes, sig_dict, None, sentinel_pub, None)
         if not ok:
@@ -416,7 +414,7 @@ class SentinelController:
         Reads sentinelrc_dilithium_pub.pem from self.sentinel_runtime_base, 
         returns raw bytes. If missing => in strict/hard => raise, else warn + return b"" 
         """
-        pub_path = os.path.join(self.sentinel_runtime_base, "sentinelrc_dilithium_pub.pem")
+        pub_path = resolve_path("keys", "sentinelrc_dilithium_pub.pem")
         if not os.path.isfile(pub_path):
             msg = "sentinelrc_dilithium_pub.pem not found => cannot verify .sentinelrc signature in strict/hard"
             logger.warning(msg)
