@@ -20,7 +20,9 @@ import hashlib
 import threading
 import datetime
 from typing import Dict, Optional, Any
+from pathlib import Path
 
+from aepok_sentinel.core.directory_contract import resolve_path
 from aepok_sentinel.core.logging_setup import get_logger
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, is_watch_only
@@ -59,18 +61,18 @@ class SecurityDaemon:
                  config: SentinelConfig,
                  license_mgr: LicenseManager,
                  audit_chain: AuditChain,
-                 hash_store_path: str = "/var/lib/sentinel/.hashes.json",
-                 quarantine_dir: str = "/var/lib/sentinel/quarantine",
-                 sign_priv_key_path: str = "/var/lib/sentinel/daemon_dilithium_priv.bin",
-                 autoban_mgr: Optional[AutobanManager] = None):
+                 hash_store_path: Path = resolve_path("security", ".hashes.json"),
+                 quarantine_dir: Path = resolve_path("quarantine"),
+                 sign_priv_key_path: Path = resolve_path("security", "daemon_dilithium_priv.bin"),
+                 autoban_mgr: AutobanManager):
         self.config = config
         self.license_mgr = license_mgr
         self.audit_chain = audit_chain
         self.hash_store_path = hash_store_path
         self.quarantine_dir = quarantine_dir
         self.sign_priv_key_path = sign_priv_key_path
-        self.autoban_mgr = autoban_mgr  # optional
-
+        self.autoban_mgr = autoban_mgr
+        
         # ensure quarantine_dir exists
         if not os.path.isdir(self.quarantine_dir):
             raise RuntimeError(f"Quarantine directory missing: {self.quarantine_dir}")
