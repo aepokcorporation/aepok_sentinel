@@ -381,6 +381,21 @@ class ProvisionDevice:
                 except Exception as e:
                     raise ProvisionError(f"Failed to compute hash for {path}: {e}")
 
+        # Enforce required trust anchor entries
+        required_paths = [
+            "config/.sentinelrc",
+            "license/license.key",
+            "config/identity.json"
+        ]
+        present_keys = list(anchor_obj["hashes"].keys())
+        has_kyber = any("kyber_priv" in p for p in present_keys)
+        has_dil = any("dilithium_priv" in p for p in present_keys)
+
+        missing_required = [r for r in required_paths if r not in present_keys]
+        if missing_required or not (has_kyber and has_dil):
+            raise ProvisionError(
+                f"trust_anchor missing required files. Missing={missing_required}, kyber={has_kyber}, dil={has_dil}"
+            )
         anchor_json = json.dumps(anchor_obj, indent=2)
         anchor_dir = os.path.dirname(self._trust_anchor_path)
         if not os.path.isdir(anchor_dir):
