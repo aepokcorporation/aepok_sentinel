@@ -295,6 +295,19 @@ class SentinelController:
             logger.warning(msg)
             if self._must_fail():
                 raise ControllerError(msg)
+        
+        # check sentinelrc_dilithium_pub.pem
+        sentinelrc_pub_path = os.path.join(self.sentinel_runtime_base, "sentinelrc_dilithium_pub.pem"
+        sentinelrc_pub_hash_expected = anchor_obj.get("sentinelrc_pub_sha256")
+        if sentinelrc_pub_hash_expected:
+            try:
+                self._verify_file_hash(sentinelrc_pub_path, sentinelrc_pub_hash_expected, "sentinelrc_dilithium_pub.pem")
+            except Exception as e:
+                if self._must_fail():
+                    raise ControllerError(str(e))
+                logger.warning(str(e))
+        else:
+            logger.warning("trust_anchor.json missing 'sentinelrc_pub_sha256' => cannot bind sentinelrc_dilithium_pub.pem")
 
         # identity.json
         identity_path = os.path.join(self.sentinel_runtime_base, "identity.json")
