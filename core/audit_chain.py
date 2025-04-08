@@ -192,6 +192,15 @@ class AuditChain:
         # re-validate replay? Not necessarily each time, but let's do a quick check
         if not self._check_boot_hash():
             logger.error("Chain replay suspected. Boot hash mismatch.")
+            try:
+                self.append_event("CHAIN_REPLAY_SUSPECTED", {
+                    "timestamp": _utc_iso_now(),
+                    "reason": "boot_hash mismatch",
+                    "expected_root": self.boot_hash.get("last_known_root", "unknown"),
+                    "actual_root": self._get_current_merkle_root()
+                })
+            except Exception:
+                pass  # avoid infinite recursion if audit chain is already failing
             raise ChainTamperDetectedError("Replay or tampering suspected on boot_hash mismatch.")
 
         # Lock the chain file
@@ -553,8 +562,26 @@ class AuditChain:
         with open(output_path, "w", encoding="utf-8") as out_f:
             out_f.write(content)
 
-        # 4) sign, log event etc.
-        self.append_event("EXPORT_CHAIN", {"export_path": output_path})
+        # 4) optionally write .sig or hash to accompany export
+        sig_path = output_path + ".sig"
+        prov_hash = hashlib.sha512(content.encode("utf-8")).hexdigest()
+        try:
+            if self.pqc_priv_keys.get("dilithium"):
+                sig_bundle = sign_content_bundle(content.encode("utf-8"), None, self.pqc_priv_keys["dilithium"], self.pqc_priv_keys.get("rsa"))
+                import base64, json as j
+                sig_json = j.dumps(sig_bundle).encode("utf-8")
+                sig_b64 = base64.b64encode(sig_json)
+                with open(sig_path, "wb") as sf:
+                    sf.write(sig_b64)
+        except Exception as e:
+            logger.warning("Failed to write audit chain export signature: %s", e)
+
+        # 5) log event with export path and provenance hash
+        self.append_event("EXPORT_CHAIN", {
+            "export_path": output_path,
+            "signature_path": sig_path,
+            "provenance_sha512": prov_hash
+        })
 
     def compute_provenance_hash(self) -> str:
         """
