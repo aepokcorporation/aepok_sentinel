@@ -765,3 +765,31 @@ class AuditChain:
                 "error": str(e),
                 "path": full_path
             })
+
+    def trigger_anchor_now(self) -> None:
+        """
+        Manually triggers an external anchor submission using the current Merkle root and latest checkpoint file.
+        This is intended for CLI or GUI manual use.
+        """
+        # Validate the current chain
+        valid = self.validate_chain(raise_on_fail=False)
+        if not valid:
+            logger.warning("Manual anchor aborted: audit chain is not valid.")
+            self.append_event("ANCHOR_EXPORT_FAILED", {"reason": "chain_invalid_on_manual_trigger"})
+            return
+
+        # Get final Merkle root
+        final_root = self._get_current_merkle_root()
+
+        # Try to find the most recent checkpoint file
+        checkpoint_files = sorted(
+            [f for f in os.listdir(self.audit_dir) if f.startswith("chain_checkpoint_") and f.endswith(".json")],
+            reverse=True
+        )
+        if not checkpoint_files:
+            self.append_event("ANCHOR_EXPORT_FAILED", {"reason": "no_checkpoint_file_found"})
+            logger.warning("Manual anchor aborted: no checkpoint file available.")
+            return
+
+        latest_checkpoint = os.path.join(self.audit_dir, checkpoint_files[0])
+        self._submit_to_external_anchor(final_root, latest_checkpoint)
