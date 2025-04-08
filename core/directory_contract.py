@@ -137,4 +137,8 @@ def resolve_path(*path_parts: str) -> Path:
     Example:
         log_file = resolve_path("logs", "sentinel.log")
     """
-    return SENTINEL_RUNTIME_BASE.joinpath(*path_parts)
+
+    resolved = SENTINEL_RUNTIME_BASE.joinpath(*path_parts).resolve()
+        if not str(resolved).startswith(str(SENTINEL_RUNTIME_BASE)):
+            raise ValueError(f"Unsafe path resolution: {resolved}")
+        return resolved
