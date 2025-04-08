@@ -326,6 +326,7 @@ class KeyManager:
     def _restore_backup(self, backup_dir: str) -> None:
         """
         Revert from backup. Remove any new files. Then copy backups back in.
+        Logs KEY_ROTATION_REVERTED to audit chain if audit_chain exists.
         """
         # remove new key files
         for f in os.listdir(self.keys_dir):
@@ -337,6 +338,12 @@ class KeyManager:
             dst = os.path.join(self.keys_dir, bf)
             shutil.copy2(src, dst)
         logger.info("Restored old keys from backup: %s", backup_dir)
+
+        if self.audit_chain:
+            self._chain_event(EventCode.KEY_ROTATION_REVERTED, {
+                "backup_dir": backup_dir,
+                "timestamp": self._utc_now_str()
+            })
 
     def _purge_old_generations(self) -> None:
         """
