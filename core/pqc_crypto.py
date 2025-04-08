@@ -426,27 +426,34 @@ def verify_content_signature(
         logger.warning("Dilithium signature verification failed: %s", e)
         return False
 
-    # 2) RSA fallback check
-    rsa_sig_b64 = signatures.get("rsa", "")
-    fallback_allowed = (
-        config.allow_classical_fallback and
-        rsa_pub is not None and
-        rsa_sig_b64 and
-        not (config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"))
-    )
-    if fallback_allowed:
-        try:
-            rsa_sig = base64.b64decode(rsa_sig_b64)
-            pub_key = _load_rsa_public_key(rsa_pub)
-            pub_key.verify(
-                rsa_sig,
-                data,
-                asym_padding.PKCS1v15(),
-                hashes.SHA256()
-            )
-        except Exception as e:
-            logger.warning("RSA signature verification failed: %s", e)
-            return False
+        # 2) RSA fallback check
+        rsa_sig_b64 = signatures.get("rsa", "")
+        fallback_allowed = (
+            config.allow_classical_fallback and
+            rsa_pub is not None and
+            rsa_sig_b64 and
+            not (config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"))
+        )
+        if fallback_allowed:
+            try:
+                rsa_sig = base64.b64decode(rsa_sig_b64)
+                pub_key = _load_rsa_public_key(rsa_pub)
+                pub_key.verify(
+                    rsa_sig,
+                    data,
+                    asym_padding.PKCS1v15(),
+                    hashes.SHA256()
+                )
+                # Log fallback signature usage
+                from aepok_sentinel.core import audit_chain
+                audit_chain.append_event("SIGNATURE_RSA_USED", {
+                    "context": "verify_content_signature",
+                    "enforcement_mode": config.enforcement_mode,
+                    "host_fingerprint": config.raw_dict.get("host_fingerprint", "unknown")
+                })
+            except Exception as e:
+                logger.warning("RSA signature verification failed: %s", e)
+                return False
 
     return True
 
