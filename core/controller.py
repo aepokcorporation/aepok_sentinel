@@ -32,6 +32,7 @@ from aepok_sentinel.core.autoban import AutobanManager
 from aepok_sentinel.core.constants import EventCode
 from aepok_sentinel.core.pqc_crypto import verify_content_signature, CryptoSignatureError
 from aepok_sentinel.core.pqc_crypto import sign_content_bundle, CryptoDecryptionError
+from aepok_sentinel.core.directory_contract import resolve_path
 
 logger = get_logger("controller")
 
