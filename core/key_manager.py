@@ -81,8 +81,8 @@ class KeyManager:
             raise RuntimeError(f"Lockfile directory missing: {os.path.dirname(self._lockfile_path)}")
 
         # signature: we sign each key with local device Dilithium key
-        self.device_dil_priv_path = resolve_path(os.path.join(self.sentinel_runtime_base, "keys", "device_dilithium_priv.bin"))
-        self.device_dil_pub_path = resolve_path(os.path.join(self.sentinel_runtime_base, "keys", "device_dilithium_pub.bin"))
+        self.vendor_dil_priv_path = resolve_path(os.path.join(self.sentinel_runtime_base, "keys", "vendor_dilithium_priv.bin"))
+        self.vendor_dil_pub_path = resolve_path(os.path.join(self.sentinel_runtime_base, "keys", "vendor_dilithium_pub.bin"))
 
     def fetch_current_keys(self) -> Dict[str, bytes]:
         """
@@ -184,7 +184,7 @@ class KeyManager:
     def _load_local_keys_latest(self) -> Dict[str, bytes]:
         """
         Scans self.keys_dir for the newest keys of each type (kyber, dil) + optional RSA.
-        For each found file, also read <filename>.sig, verify with device_dil_pub.
+        For each found file, also read <filename>.sig, verify with vendor_dil_pub.
         Raises KeyManagerError if anything is missing or signature is invalid,
         in strict/hardened => fail immediately.
         """
@@ -267,7 +267,7 @@ class KeyManager:
 
     def _verify_new_keys_tmp(self, tmp_dir: str) -> None:
         """
-        Reads each key in tmp_dir, verifies the signature with device_dil_public, no partial fallback.
+        Reads each key in tmp_dir, verifies the signature with vendor_dil_public, no partial fallback.
         If any fail => raise KeyManagerError
         """
         # we expect kyber_priv.bin, dilithium_priv.bin, and maybe rsa_priv.pem
@@ -395,7 +395,7 @@ class KeyManager:
 
     def _read_and_verify(self, keypath: str) -> bytes:
         """
-        Reads the key file + key file.sig => verify with device_dil_pub
+        Reads the key file + key file.sig => verify with vendor_dil_pub
         If missing .sig => fail in strict/hardened
         If invalid => fail in strict/hardened
         Return the raw key bytes if valid
@@ -433,10 +433,10 @@ class KeyManager:
                 raise KeyManagerError(msg)
             return b""
 
-        # we read device_dil_pub
+        # we read vendor_dil_pub
         try:
-            with open(self.device_dil_pub_path, "rb") as pf:
-                device_dil_pub = pf.read()
+            with open(self.vendor_dil_pub_path, "rb") as pf:
+                vendor_dil_pub = pf.read()
         except Exception as e:
             msg = f"Missing or unreadable device dilithium pub: {e}"
             logger.error(msg)
@@ -449,7 +449,7 @@ class KeyManager:
         from copy import deepcopy
         temp_cfg = deepcopy(self.config)
         # embed host_fingerprint, signer_id, etc. if needed
-        ok = verify_content_signature(raw_key, sig_dict, temp_cfg, device_dil_pub, None)
+        ok = verify_content_signature(raw_key, sig_dict, temp_cfg, vendor_dil_pub, None)
         if not ok:
             msg = f"Signature invalid for key file {keypath}"
             logger.error(msg)
@@ -471,14 +471,14 @@ class KeyManager:
 
         # sign
         try:
-            with open(self.device_dil_priv_path, "rb") as pf:
-                device_dil_priv = pf.read()
+            with open(self.vendor_dil_priv_path, "rb") as pf:
+                vendor_dil_priv = pf.read()
         except Exception as e:
             raise KeyManagerError(f"Missing device Dil priv for signing: {e}")
 
         from copy import deepcopy
         temp_cfg = deepcopy(self.config)
-        sig_bundle = sign_content_bundle(data, temp_cfg, device_dil_priv, None)
+        sig_bundle = sign_content_bundle(data, temp_cfg, vendor_dil_priv, None)
         sig_json = json.dumps(sig_bundle).encode("utf-8")
         sig_b64 = base64.b64encode(sig_json)
         sigfile = path + ".sig"
