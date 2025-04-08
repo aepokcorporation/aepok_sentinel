@@ -81,20 +81,23 @@ class LicenseManager:
             raise RuntimeError(f"Sentinel runtime base does not exist: {self.runtime_base}")
 
         # resolve license path
-        self.license_path = resolve_path(os.path.join(self.runtime_base, "license", "license.key"))
+        self.license_path = resolve_path("license", "license.key")
         if "license_path" in config.raw_dict:
-            # user-specified override, also enforced via resolve_path
-            self.license_path = resolve_path(config.raw_dict["license_path"])
+            candidate = Path(config.raw_dict["license_path"])
+            resolved = resolve_path(*candidate.parts)
+            if not str(resolved).startswith(str(SENTINEL_RUNTIME_BASE)):
+                raise LicenseError(f"Rejected unsafe override path: {resolved}")
+            self.license_path = resolved
 
         # load sealed identity
-        identity_path = resolve_path(os.path.join(self.runtime_base, "config", "identity.json"))
+        identity_path = resolve_path("config", "identity.json")
         self.host_identity = read_host_identity(
             identity_path,
             self._get_enforcement_mode()
         )
 
         # load or create (if permissible) the install_state file (no silent creation => must exist in strict/hardened)
-        self.install_state_path = resolve_path(os.path.join(self.runtime_base, "license", self.INSTALL_STATE_FILENAME))
+        self.install_state_path = resolve_path("license", self.INSTALL_STATE_FILENAME)
         self.install_state = self._load_install_state()
 
     def load_license(self) -> None:
@@ -247,7 +250,7 @@ class LicenseManager:
 
         # Production fix => load from file in runtime/keys/vendor_dilithium_pub.pem
         try:
-            pub_path = resolve_path(os.path.join(self.runtime_base, "keys", "vendor_dilithium_pub.pem"))
+            pub_path = resolve_path("keys", "vendor_dilithium_pub.pem")
             with open(pub_path, "rb") as pf:
                 dil_pub = pf.read()
         except Exception as e:
@@ -258,7 +261,7 @@ class LicenseManager:
         if self.config.allow_classical_fallback:
             # optionally load an anchored RSA pub if needed
             try:
-                rsa_path = resolve_path(os.path.join(self.runtime_base, "keys", "vendor_rsa_pub.pem"))
+                rsa_path = resolve_path("keys", "vendor_rsa_pub.pem")
                 with open(rsa_path, "rb") as rf:
                     rsa_pub = rf.read()
             except Exception:
@@ -367,7 +370,7 @@ class LicenseManager:
             import base64, json as j
             sig_dict = j.loads(base64.b64decode(sig_bytes).decode("utf-8"))
 
-            pub_path = resolve_path(os.path.join(self.runtime_base, "keys", "vendor_dilithium_pub.pem"))
+            pub_path = resolve_path("keys", "vendor_dilithium_pub.pem")
             with open(pub_path, "rb") as pf:
                 vendor_dil_pub = pf.read()
 
@@ -400,7 +403,7 @@ class LicenseManager:
                     f.write(content_str)
 
                 # Sign it
-                priv_path = resolve_path(os.path.join(self.runtime_base, "keys", "vendor_dilithium_priv.bin"))
+                priv_path = resolve_path("keys", "vendor_dilithium_priv.pem")
                 with open(priv_path, "rb") as kf:
                     vendor_dil = kf.read()
 
