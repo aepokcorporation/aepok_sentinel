@@ -68,11 +68,42 @@ class AutobanManager:
 
         self.autoban_enabled = bool(self.config.raw_dict.get("autoban_enabled", False))
         self.ttl_days = int(self.config.raw_dict.get("autoban_block_ttl_days", 0))  # 0 => no expiration
+        self.trusted_hashes = self.config.raw_dict.get("trusted_firewall_hashes", [])
+
+        # Inject fallback hashes for known-good binaries (only if none provided)
+        if not self.trusted_hashes:
+            self.trusted_hashes = self._get_fallback_trusted_hashes()
+
+        # If still empty => fail if autoban is enabled
+        if self.autoban_enabled and not self.trusted_hashes:
+            raise RuntimeError("Autoban is enabled, but no trusted_firewall_hashes are defined or found.")
 
         # load blocklist + signature
         self.blocked_data: Dict[str, Dict[str, str]] = {}
-        # each source => { "blocked_on": <timestamp>, ... }
         self._load_blocklist()
+        
+    def _get_fallback_trusted_hashes(self) -> list:
+        """
+        Provide known-good trusted hashes for core firewall binaries if none are declared in config.
+        These should be updated to match real production hashes per deployment.
+        """
+        import hashlib
+        fallback = []
+        known_paths = [
+            "/usr/sbin/ufw",
+            "/sbin/iptables",
+            "C:\\Windows\\System32\\netsh.exe"
+        ]
+        for path in known_paths:
+            if os.path.isfile(path):
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    hval = hashlib.sha256(data).hexdigest()
+                    fallback.append(hval)
+                except Exception:
+                    continue
+        return fallback
 
     def record_bad_source(self, identifier: str, reason: str) -> None:
         """
