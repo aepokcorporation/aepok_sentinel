@@ -696,17 +696,72 @@ class AuditChain:
             raise ChainTamperDetectedError(msg)
         return False
 
-    def _submit_to_external_anchor(self, final_root: str, cpoint_path: Union[str, os.PathLike]):
+    def _submit_to_external_anchor(self, final_root: str, cpoint_path: Union[str, os.PathLike]) -> None:
         """
-        Hook to push final_root + checkpoint signature to a remote TSP or airgap aggregator.
-        This is left as a placeholder. If self.anchor_config is defined, we attempt it.
+        Writes anchor_submission_<UTC>.json to the directory defined in .sentinelrc["anchor_export_path"].
+        Includes full bundle: merkle root, checkpoint filename, host/license info, and signed hash.
+        If path is missing => logs ANCHOR_EXPORT_FAILED and aborts silently.
         """
-        logger.info(
-            "Submitting chain root '%s' and checkpoint '%s' to external anchor with config=%s",
-            final_root,
-            cpoint_path,
-            self.anchor_config
-        )
-        # ...
-        # Actual logic depends on your environment.
-        # ...
+        export_dir = self.anchor_config.get("anchor_export_path") if self.anchor_config else None
+        if not export_dir or not os.path.isdir(export_dir):
+            try:
+                self.append_event("ANCHOR_EXPORT_FAILED", {
+                    "reason": "anchor_export_path missing or invalid",
+                    "path": export_dir or "undefined",
+                    "final_root": final_root,
+                    "checkpoint": str(cpoint_path)
+                })
+            except Exception:
+                pass
+            return
+
+        from datetime import datetime
+        import base64, json as j
+
+        utc_ts = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        fname = f"anchor_submission_{utc_ts.replace(':', '').replace('-', '').replace('Z', '')}.json"
+        full_path = os.path.join(export_dir, fname)
+
+        payload = {
+            "timestamp": utc_ts,
+            "final_merkle_root": final_root,
+            "checkpoint_filename": os.path.basename(cpoint_path),
+            "enforcement_mode": self.anchor_config.get("enforcement_mode", "unspecified"),
+            "host_fingerprint": self.anchor_config.get("host_fingerprint", "unknown"),
+            "license_uuid": self.anchor_config.get("license_uuid", "unknown"),
+            "source_chain_file": "audit_chain.log"
+        }
+
+        try:
+            if self.pqc_priv_keys.get("dilithium"):
+                sig_bundle = sign_content_bundle(
+                    json.dumps(payload, sort_keys=True).encode("utf-8"),
+                    None,
+                    self.pqc_priv_keys["dilithium"],
+                    self.pqc_priv_keys.get("rsa")
+                )
+                payload["signature"] = base64.b64encode(j.dumps(sig_bundle).encode("utf-8")).decode("utf-8")
+            else:
+                payload["signature"] = ""
+        except Exception as e:
+            self.append_event("ANCHOR_EXPORT_FAILED", {
+                "reason": "signature_failed",
+                "error": str(e),
+                "final_root": final_root
+            })
+            return
+
+        try:
+            with open(full_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            self.append_event("ANCHOR_EXPORTED", {
+                "path": full_path,
+                "final_root": final_root,
+                "checkpoint": os.path.basename(cpoint_path)
+            })
+        except Exception as e:
+            self.append_event("ANCHOR_EXPORT_FAILED", {
+                "reason": "write_failed",
+                "error": str(e),
+                "path": full_path
+            })
