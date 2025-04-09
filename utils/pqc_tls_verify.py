@@ -58,10 +58,10 @@ def verify_negotiated_pqc(tls_sock: ssl.SSLSocket, config: SentinelConfig) -> bo
 
     mode = config.tls_mode.lower()
     if mode == "classical":
-        # Even if strict_transport is set, user config is contradictory, but we accept classical.
-        if config.strict_transport:
-            logger.warning("Config mismatch: classical + strict_transport => allowing classical.")
-        return True
+       if config.strict_transport:
+           logger.error("Strict transport disallows classical TLS. Rejecting session.")
+           return False
+       return True
 
     if mode == "pqc-only":
         if "kyber" not in group_name.lower():
