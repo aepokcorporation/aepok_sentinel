@@ -1,3 +1,16 @@
+# test_audit_chain.py
+"""
+Unit tests for audit_chain.py
+
+Covers:
+ - Initialization failure if 'audit' dir missing
+ - append_event -> single event => valid chain
+ - Replay detection via tampered boot_hash
+ - Rollover + checkpoint creation
+ - Optional background verification setup
+ - .chain_tmp usage
+"""
+
 import os
 import json
 import shutil
@@ -33,34 +46,35 @@ class TestAuditChain(unittest.TestCase):
 
     @patch("aepok_sentinel.core.audit_chain.resolve_path")
     def test_basic_append_and_validate(self, mock_resolve_path):
-        audit_path = Path(self.temp_dir) / "audit"
-        audit_path.mkdir()  # create the folder
-        mock_resolve_path.return_value = audit_path
-
-        chain = AuditChain(
-            pqc_priv_keys={},  # no signing
-            pqc_pub_keys={},   # no verifying
-            max_size_bytes=1000
-        )
-        chain.append_event("CONFIG_LOADED", {"file": ".sentinelrc"})
-        is_valid = chain.validate_chain(raise_on_fail=False)
-        self.assertTrue(is_valid, "Expected chain to be valid with a single event")
-
-    @patch("aepok_sentinel.core.audit_chain.resolve_path")
-    def test_replay_detection(self, mock_resolve_path):
+        # Create the 'audit' folder
         audit_path = Path(self.temp_dir) / "audit"
         audit_path.mkdir()
         mock_resolve_path.return_value = audit_path
 
         chain = AuditChain(
-            pqc_priv_keys={},  # no signing
+            pqc_priv_keys={},
             pqc_pub_keys={},
             max_size_bytes=1000
         )
-        # append an event
+        chain.append_event("CONFIG_LOADED", {"file": ".sentinelrc"})
+        is_valid = chain.validate_chain(raise_on_fail=False)
+        self.assertTrue(is_valid, "Expected valid single-event chain")
+
+    @patch("aepok_sentinel.core.audit_chain.resolve_path")
+    def test_replay_detection(self, mock_resolve_path):
+        # Create 'audit' folder
+        audit_path = Path(self.temp_dir) / "audit"
+        audit_path.mkdir()
+        mock_resolve_path.return_value = audit_path
+
+        chain = AuditChain(
+            pqc_priv_keys={},
+            pqc_pub_keys={},
+            max_size_bytes=1000
+        )
         chain.append_event("FIRST_EVENT", {})
 
-        # tamper with boot_hash => set last_known_root = something else
+        # Tamper boot_hash => set last_known_root to something else
         boot_hash_file = audit_path / "boot_hash.json"
         with open(boot_hash_file, "r", encoding="utf-8") as bf:
             data = json.load(bf)
@@ -68,7 +82,7 @@ class TestAuditChain(unittest.TestCase):
         with open(boot_hash_file, "w", encoding="utf-8") as bf:
             json.dump(data, bf)
 
-        # now append a new event => should raise ChainTamperDetectedError
+        # new event => ChainTamperDetectedError
         with self.assertRaises(ChainTamperDetectedError):
             chain.append_event("SECOND_EVENT", {})
 
@@ -78,31 +92,27 @@ class TestAuditChain(unittest.TestCase):
         audit_path.mkdir()
         mock_resolve_path.return_value = audit_path
 
-        # Provide a mock private key to see if checkpoint is signed
         dummy_dil_priv = b"DIL_PRIV_KEY"
         chain = AuditChain(
             pqc_priv_keys={"dilithium": dummy_dil_priv},
             pqc_pub_keys={},
-            max_size_bytes=300  # small => triggers rollover quickly
+            max_size_bytes=300
         )
 
-        # append multiple events
+        # multiple events
         for i in range(5):
-            chain.append_event(f"EVENT_{i}", {"idx": i, "data": "x" * 50})  # each ~ 70+ bytes => triggers rollover
+            chain.append_event(f"EVENT_{i}", {"idx": i, "data": "x" * 50})
 
-        # check if old chain file was renamed
         files = os.listdir(audit_path)
         old_chain_logs = [f for f in files if f.startswith("old_chain_")]
-        self.assertTrue(len(old_chain_logs) >= 1, "Expected at least one old_chain_ file after rollover")
+        self.assertTrue(len(old_chain_logs) >= 1, "Expected old_chain_ after rollover")
 
-        # check for checkpoint
         cpoints = [f for f in files if f.startswith("chain_checkpoint_")]
-        self.assertTrue(len(cpoints) >= 1, "Expected at least one chain_checkpoint_ file after rollover")
+        self.assertTrue(len(cpoints) >= 1, "Expected chain_checkpoint_ after rollover")
 
-        # see if checkpoint has 'signature'
         with open(audit_path / cpoints[0], "r", encoding="utf-8") as cf:
             cdata = json.load(cf)
-        self.assertIn("signature", cdata, "checkpoint file should have a signature if we had a private key")
+        self.assertIn("signature", cdata, "Checkpoint should have a signature with dilithium key")
 
     @patch("aepok_sentinel.core.audit_chain.resolve_path")
     def test_background_verification(self, mock_resolve_path):
@@ -114,22 +124,17 @@ class TestAuditChain(unittest.TestCase):
             pqc_priv_keys={},
             pqc_pub_keys={},
             max_size_bytes=500,
-            background_verification_interval=1  # 1 minute
+            background_verification_interval=1
         )
 
-        # We won't actually wait a full minute. We'll patch time.sleep or we can do a quick test 
-        # showing the thread is started. Then we'll stop it.
-        self.assertIsNotNone(chain._bg_thread, "Expected a background thread to be started")
-        self.assertTrue(chain._bg_thread.is_alive(), "Background thread should be alive")
+        self.assertIsNotNone(chain._bg_thread, "Expect background verification thread")
+        self.assertTrue(chain._bg_thread.is_alive())
 
         chain.stop()
-        self.assertFalse(chain._bg_thread.is_alive(), "Background thread should be stopped after chain.stop()")
+        self.assertFalse(chain._bg_thread.is_alive())
 
     @patch("aepok_sentinel.core.audit_chain.resolve_path")
     def test_atomic_write_via_chain_tmp(self, mock_resolve_path):
-        """
-        Confirm that appending an event writes to .chain_tmp first, then appends to chain file.
-        """
         audit_path = Path(self.temp_dir) / "audit"
         audit_path.mkdir()
         mock_resolve_path.return_value = audit_path
@@ -137,16 +142,9 @@ class TestAuditChain(unittest.TestCase):
         chain = AuditChain(pqc_priv_keys={}, pqc_pub_keys={})
         chain.append_event("TEST_EVENT", {})
 
-        # check that .chain_tmp exists but is empty afterwards or removed
         tmp_path = audit_path / "audit_chain_tmp.json"
-        self.assertTrue(tmp_path.is_file(), ".chain_tmp should be created during append")
-        # but it might or might not be empty after the write. Let's check contents
-        with open(tmp_path, "r", encoding="utf-8") as tf:
-            tmp_contents = tf.read().strip()
-        # There's no strict requirement to remove or empty it after, but let's see if it's stale
-        self.assertTrue(len(tmp_contents) > 0, "tmp file might still contain the last record")
+        self.assertTrue(tmp_path.is_file(), ".chain_tmp should exist during append")
 
-        # chain file should have the new record
         chain_file = audit_path / "audit_chain.log"
         with open(chain_file, "r", encoding="utf-8") as cf:
             lines = cf.readlines()
