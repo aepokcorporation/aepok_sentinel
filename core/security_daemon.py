@@ -317,13 +317,12 @@ class SecurityDaemon:
         """
         Moves file to quarantine, logs event with old/new hash or threat details, plus intrusion source if any.
         """
-        bn = os.path.basename(filepath)
-        q_path = os.path.join(self.quarantine_dir, bn)
+        bn = Path(filepath).name
+        q_path = self.quarantine_dir / bn
         i = 0
-        while os.path.exists(q_path):
+        while q_path.exists():
             i += 1
-            q_path = os.path.join(self.quarantine_dir, f"{bn}.{i}")
-
+            q_path = self.quarantine_dir / f"{bn}.{i}"
         try:
             shutil.move(filepath, q_path)
         except Exception as e:
@@ -416,7 +415,7 @@ class SecurityDaemon:
         """
         if not os.path.isfile(self.hash_store_path):
             return
-        sig_path = self.hash_store_path + ".sig"
+        sig_path = self.hash_store_path.with_suffix(".json.sig")
         if not os.path.isfile(sig_path):
             logger.warning("Hash store signature missing => ignoring existing store.")
             return
