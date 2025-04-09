@@ -390,8 +390,12 @@ class SecurityDaemon:
             with open(sig_path, "rb") as sf:
                 sig_bytes = sf.read()
 
-            with open(self.sign_priv_key_path, "rb") as kf:
-                dil_priv = kf.read()
+            pub_path = resolve_path("keys", "vendor_dilithium_pub.pem")
+            try:
+                dil_pub = pub_path.read_bytes()
+            except Exception as e:
+                logger.warning("Missing/unreadable vendor_dilithium_pub.pem for hash store verify: %s", e)
+                return
 
             import base64, json as j
             sig_dict = j.loads(base64.b64decode(sig_bytes).decode("utf-8"))
