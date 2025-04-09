@@ -1,17 +1,19 @@
+# test_pqc_tls_verify.py
 """
-Unit tests for aepok_sentinel/utils/pqc_tls_verify.py (Final Shape)
-Covering:
- - verify_negotiated_pqc with config combos
- - get_server_cert_fingerprint
- - verify_cert_fingerprint
- - check_session_resumption
- - log_tls_verification_event => ensures audit chain is called
+Unit tests for pqc_tls_verify.py
+
+Verifies:
+ - verify_negotiated_pqc with different config combos
+ - get_server_cert_fingerprint (empty / valid)
+ - verify_cert_fingerprint (matching / mismatching)
+ - check_session_resumption (true/false)
+ - log_tls_verification_event => ensures audit chain logging
 """
 
 import unittest
 from unittest.mock import patch, MagicMock
-
 import ssl
+
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.utils.pqc_tls_verify import (
     verify_negotiated_pqc,
@@ -24,7 +26,6 @@ from aepok_sentinel.utils.pqc_tls_verify import (
 
 
 class TestPqcTlsVerify(unittest.TestCase):
-
     def setUp(self):
         self.cfg_dict = {
             "schema_version": 1,
@@ -37,9 +38,6 @@ class TestPqcTlsVerify(unittest.TestCase):
 
     @patch("aepok_sentinel.utils.pqc_tls_verify._get_negotiated_group", return_value="X25519Kyber768")
     def test_verify_hybrid_pqc_ok(self, mock_grp):
-        """
-        hybrid => if strict=False => always pass, or strict=True => must have 'kyber'
-        """
         self.cfg.raw_dict["tls_mode"] = "hybrid"
         self.cfg.raw_dict["strict_transport"] = True
         mock_sock = MagicMock()
