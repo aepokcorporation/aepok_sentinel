@@ -328,6 +328,18 @@ class KeyManager:
                 encryption_algorithm=serialization.NoEncryption()
             )
 
+            rsa_fp = hashlib.sha256(rsa_priv).hexdigest()[:16]
+            if self.audit_chain:
+                try:
+                    self.audit_chain.append_event("RSA_KEY_GENERATED", {
+                        "enabled_by_config": True,
+                        "fingerprint_prefix": rsa_fp,
+                        "enforcement_mode": self.config.enforcement_mode,
+                        "strict_transport": self.config.strict_transport
+                    })
+                except Exception as e:
+                    logger.warning("Failed to emit RSA_KEY_GENERATED audit event: %s", e)
+
         # write + sign
         self._write_and_sign(tmp_dir / "kyber_priv.bin",     kyb_priv)
         self._write_and_sign(tmp_dir / "dilithium_priv.bin", dil_priv)
