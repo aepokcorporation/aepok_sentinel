@@ -328,7 +328,7 @@ class SentinelController:
             if self._must_fail():
                 raise ControllerError(f"disk_sanity_check error in strict mode: {e}")
 
-    def _verify_trust_anchor_and_identity(self) -> None:
+        def _verify_trust_anchor_and_identity(self) -> None:
         """
         Verifies trust_anchor.json + identity.json (and their .sig) for:
           - vendor_dilithium_pub.pem hash
@@ -341,30 +341,7 @@ class SentinelController:
         anchor_sig = resolve_path("config", "trust_anchor.json.sig")
         self._verify_file_signature(anchor_path, anchor_sig, desc="trust_anchor.json")
 
-        expected_id_hash = anchor_obj.get("identity_json_sha256")
-        if expected_id_hash:
-            import hashlib
-            try:
-                data = identity_path.read_bytes()
-                actual_hash = hashlib.sha256(data).hexdigest()
-                if actual_hash != expected_id_hash.lower():
-                    msg = (
-                        f"identity.json hash mismatch => expected={expected_id_hash}, got={actual_hash}"
-                    )
-                    logger.error(msg)
-                    if self._must_fail():
-                        raise ControllerError(msg)
-                    else:
-                        logger.warning("identity.json hash mismatch => continuing in permissive mode.")
-            except Exception as e:
-                msg = f"Failed to compute identity.json hash => {e}"
-                logger.error(msg)
-                if self._must_fail():
-                    raise ControllerError(msg)
-        else:
-            logger.warning("No identity_json_sha256 in trust_anchor => skipping hash bind.")
-
-        # parse trust_anchor to check vendor_dil pub hash
+        # parse trust_anchor to check file hashes + embedded binding
         try:
             with open(anchor_path, "r", encoding="utf-8") as f:
                 anchor_obj = json.load(f)
@@ -373,6 +350,25 @@ class SentinelController:
                 raise ControllerError(f"Cannot parse trust_anchor.json in strict/hardened: {e}")
             logger.warning("trust_anchor.json parse error => permissive degrade: %s", e)
             anchor_obj = {}
+
+        file_hashes = anchor_obj.get("hashes", {})
+        for rel_path in file_hashes.keys():
+            if rel_path == "config/identity.json":  # already verified later
+                continue
+            try:
+                abs_path = resolve_path(*rel_path.split("/"))
+                sig_path = abs_path.with_suffix(abs_path.suffix + ".sig")
+                if not abs_path.is_file() or not sig_path.is_file():
+                    msg = f"{rel_path} or its .sig is missing => trust anchor integrity broken"
+                    logger.warning(msg)
+                    if self._must_fail():
+                        raise ControllerError(msg)
+                    continue
+                self._verify_file_signature(abs_path, sig_path, desc=rel_path)
+            except Exception as e:
+                logger.warning("Signature check failed for %s => %s", rel_path, e)
+                if self._must_fail():
+                    raise ControllerError(f"Signature check failed for {rel_path}: {e}")
 
         vend_pub_path = resolve_path("keys", "vendor_dilithium_pub.pem")
         vend_pub_hash = anchor_obj.get("vendor_dil_pub_sha256")
@@ -396,6 +392,30 @@ class SentinelController:
         identity_path = resolve_path("config", "identity.json")
         identity_sig = resolve_path("config", "identity.json.sig")
         self._verify_file_signature(identity_path, identity_sig, desc="identity.json")
+
+        # === MOVED: identity_json_sha256 binding check — must follow anchor_obj load ===
+        expected_id_hash = anchor_obj.get("identity_json_sha256")
+        if expected_id_hash:
+            import hashlib
+            try:
+                data = identity_path.read_bytes()
+                actual_hash = hashlib.sha256(data).hexdigest()
+                if actual_hash != expected_id_hash.lower():
+                    msg = (
+                        f"identity.json hash mismatch => expected={expected_id_hash}, got={actual_hash}"
+                    )
+                    logger.error(msg)
+                    if self._must_fail():
+                        raise ControllerError(msg)
+                    else:
+                        logger.warning("identity.json hash mismatch => continuing in permissive mode.")
+            except Exception as e:
+                msg = f"Failed to compute identity.json hash => {e}"
+                logger.error(msg)
+                if self._must_fail():
+                    raise ControllerError(msg)
+        else:
+            logger.warning("No identity_json_sha256 in trust_anchor => skipping hash bind.")
 
     def _verify_file_signature(self, file_path: Path, sig_path: Path, desc: str) -> None:
         """
