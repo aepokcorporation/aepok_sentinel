@@ -265,10 +265,10 @@ class AutobanManager:
             return
 
         try:
-            with open(self.sign_priv_key_path, "rb") as kf:
-                dil_priv = kf.read()  # This usage is questionable—verifying with priv key?
+            pub_path = resolve_path("keys", "vendor_dilithium_pub.pem")
+            dil_pub = pub_path.read_bytes()
         except Exception as e:
-            logger.warning("Missing/unreadable Dilithium key for blocklist verify: %s", e)
+            logger.warning("Missing/unreadable vendor_dilithium_pub.pem for blocklist verify: %s", e)
             return
 
         import base64, json
@@ -278,7 +278,7 @@ class AutobanManager:
             logger.warning("Blocklist signature is corrupted: %s", e)
             return
 
-        if not verify_content_signature(content.encode("utf-8"), sig_dict, self.config, dil_priv, None):
+        if not verify_content_signature(content.encode("utf-8"), sig_dict, self.config, dil_pub, None):
             logger.warning("Blocklist signature invalid => ignoring blocklist.")
             return
 
