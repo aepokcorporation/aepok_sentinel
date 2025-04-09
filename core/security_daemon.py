@@ -289,13 +289,23 @@ class SecurityDaemon:
         return tampered, threat, metadata
 
     def _quarantine_file(self, filepath: str, tampered: bool, threat_name: Optional[str], meta: Dict[str, Any]) -> None:
-        basename = Path(filepath).name
-        q_path = self.quarantine_dir / basename
-        i = 0
-        while q_path.exists():
-            i += 1
-            q_path = self.quarantine_dir / f"{basename}.{i}"
+        import hashlib
+        import datetime
 
+        basename = Path(filepath).name
+
+        try:
+            with open(filepath, "rb") as f:
+                file_bytes = f.read()
+            sha256 = hashlib.sha256(file_bytes).hexdigest()[:16]
+        except Exception as e:
+            logger.error("Failed to hash file for quarantine naming => %s", e)
+            sha256 = "unhashed"
+
+        timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        composite_name = f"{basename}__{sha256}__{timestamp}"
+        q_path = self.quarantine_dir / composite_nam
+        
         try:
             shutil.move(filepath, q_path)
         except Exception as e:
