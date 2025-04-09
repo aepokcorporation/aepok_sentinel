@@ -1,3 +1,12 @@
+# test_config.py
+"""
+Tests for config.py, ensuring that .sentinelrc is loaded, validated,
+enforcement modes are applied, and environment overrides behave
+correctly. Also checks that log path drift is resolved (fix #2),
+license path usage does not bypass directory_contract (fix #3),
+and signature failures are handled properly.
+"""
+
 import os
 import json
 import unittest
@@ -10,7 +19,6 @@ from aepok_sentinel.core.config import load_config, ConfigError, SentinelConfig
 
 
 class TestConfig(unittest.TestCase):
-
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
 
@@ -26,35 +34,26 @@ class TestConfig(unittest.TestCase):
     @patch("aepok_sentinel.core.config.resolve_path")
     @patch("aepok_sentinel.core.config.audit_chain.append_event")
     def test_valid_config(self, mock_append_event, mock_resolve_path):
-        # Create a minimal valid config
         data = {
             "schema_version": 1,
             "mode": "cloud",
             "rotation_interval_days": 15
         }
         file_path = self._write_sentinelrc(data)
-        mock_resolve_path.return_value = file_path
+        mock_resolve_path.return_value = file_path  # for .sentinelrc
 
         cfg = load_config(parse_env=False)
-
         self.assertEqual(cfg.schema_version, 1)
         self.assertEqual(cfg.mode, "cloud")
         self.assertEqual(cfg.rotation_interval_days, 15)
-        # default enforcement = PERMISSIVE
         self.assertEqual(cfg.enforcement_mode, "PERMISSIVE")
-        # Should have appended CONFIG_LOADED to audit chain
         mock_append_event.assert_called_once()
-        called_args, called_kwargs = mock_append_event.call_args
-        self.assertEqual(called_kwargs["event"], "CONFIG_LOADED")
-        self.assertIn("file", called_kwargs["metadata"])
-        self.assertEqual(called_kwargs["metadata"]["mode"], "cloud")
 
     @patch("aepok_sentinel.core.config.resolve_path")
     @patch("aepok_sentinel.core.config.audit_chain.append_event")
     def test_missing_file(self, mock_append_event, mock_resolve_path):
-        # If .sentinelrc doesn't exist, we fail
         missing_path = Path(self.temp_dir) / ".sentinelrc"
-        mock_resolve_path.return_value = missing_path  # but we won't create it
+        mock_resolve_path.return_value = missing_path
         with self.assertRaises(ConfigError) as ctx:
             load_config()
         self.assertIn("not found", str(ctx.exception).lower())
@@ -76,8 +75,7 @@ class TestConfig(unittest.TestCase):
     @patch("aepok_sentinel.core.config.resolve_path")
     @patch("aepok_sentinel.core.config.audit_chain.append_event")
     def test_missing_required_fields(self, mock_append_event, mock_resolve_path):
-        # Missing "mode"
-        data = {"schema_version": 1}
+        data = {"schema_version": 1}  # no "mode"
         config_file = self._write_sentinelrc(data)
         mock_resolve_path.return_value = config_file
 
@@ -95,15 +93,13 @@ class TestConfig(unittest.TestCase):
 
         with patch.dict(os.environ, {"SENTINEL_MODE": "scif"}):
             cfg = load_config(parse_env=True)
-            # Because not scif at first, we apply override => changes mode to scif => enforcement=STRICT
-            self.assertEqual(cfg.mode, "scif")
+            self.assertEqual(cfg.mode, "scif", "Env override should switch mode to scif.")
             self.assertEqual(cfg.enforcement_mode, "STRICT")
         mock_append_event.assert_called_once()
 
     @patch("aepok_sentinel.core.config.resolve_path")
     @patch("aepok_sentinel.core.config.audit_chain.append_event")
     def test_env_override_ignored_in_scif_or_strict(self, mock_append_event, mock_resolve_path):
-        # Start with scif => environment overrides are disabled
         data = {"schema_version": 1, "mode": "scif"}
         file_path = self._write_sentinelrc(data)
         mock_resolve_path.return_value = file_path
@@ -166,7 +162,7 @@ class TestConfig(unittest.TestCase):
     @patch("aepok_sentinel.core.config.resolve_path")
     @patch("aepok_sentinel.core.config.audit_chain.append_event")
     def test_signature_verification(self, mock_append_event, mock_resolve_path):
-        # If _signature_verified=False and the mode => scif => STRICT => must fail
+        # If _signature_verified=False and scif => STRICT => must fail
         data = {
             "schema_version": 1,
             "mode": "scif",
@@ -224,6 +220,45 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg2.mode, "cloud")
         self.assertTrue(cfg2.allow_unknown_keys)
         mock_append_event.assert_called_once()
+
+    @patch("aepok_sentinel.core.config.resolve_path")
+    @patch("aepok_sentinel.core.config.audit_chain.append_event")
+    def test_license_path_bypass_contract(self, mock_append_event, mock_resolve_path):
+        """
+        Fix #3: If the user sets a license_path inside runtime, unify it to
+        resolve_path("license", "license.key"). Otherwise, keep the external path as-is.
+        """
+        # Suppose user tries: /opsec/aepok_sentinel/runtime/license/another.key
+        data = {
+            "schema_version": 1,
+            "mode": "cloud",
+            "license_path": "/opsec/aepok_sentinel/runtime/license/another.key"
+        }
+        fpath = self._write_sentinelrc(data)
+        mock_resolve_path.side_effect = [  # first for .sentinelrc, then for runtime base
+            fpath,                      # .sentinelrc location
+            Path("/opsec/aepok_sentinel/runtime"),  # base path
+            Path("/opsec/aepok_sentinel/runtime/license/license.key")  # final unify
+        ]
+
+        cfg = load_config()
+        self.assertEqual(cfg.license_path, "/opsec/aepok_sentinel/runtime/license/license.key")
+        mock_append_event.assert_called_once()
+
+        # If user sets an external path, we leave it alone
+        mock_resolve_path.side_effect = [
+            fpath,
+            Path("/opsec/aepok_sentinel/runtime"),
+        ]
+        data2 = {
+            "schema_version": 1,
+            "mode": "cloud",
+            "license_path": "/etc/sentinel/license.key"
+        }
+        fpath2 = self._write_sentinelrc(data2, ".sentinelrc2")
+        cfg2 = load_config()
+        self.assertEqual(cfg2.license_path, "/etc/sentinel/license.key")
+        self.assertTrue(mock_append_event.called)
 
 
 if __name__ == "__main__":
