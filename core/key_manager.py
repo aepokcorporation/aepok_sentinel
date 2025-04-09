@@ -1,7 +1,7 @@
 # aepok_sentinel/core/key_manager.py
 
 """
-Key Manager (Final Shape)
+Key Manager
 
 Responsibilities:
  - Load local or cloud keys in a zero-trust manner, verifying signatures if local.
