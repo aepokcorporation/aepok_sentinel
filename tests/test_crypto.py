@@ -1,22 +1,24 @@
+# test_crypto.py
 """
-Unit tests for aepok_sentinel/core/pqc_crypto.py (Final Shape)
+Unit tests for pqc_crypto.py
 
-Validates:
-- GCM vs CBC+HMAC encryption/decryption
-- PQC (Kyber) + optional RSA fallback
-- Dilithium + optional RSA dual signature
-- Tampered data => fail
-- RNG check
-- Memory zeroization on shutdown if ephemeral buffers exist
+Verifies:
+ - GCM vs CBC+HMAC encryption/decryption
+ - PQC (Kyber) + optional RSA fallback
+ - Dilithium + optional RSA dual signature
+ - Tampering detection
+ - RNG check
+ - Memory zeroization on shutdown if ephemeral buffers are used
 
-Skips if 'oqs' is missing.
+Skips if 'oqs' is unavailable.
 """
 
 import os
 import unittest
 import base64
 from unittest import skipIf, mock
-from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_padding
+
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization, hashes
 
 from aepok_sentinel.core.config import SentinelConfig
@@ -31,7 +33,6 @@ from aepok_sentinel.core.pqc_crypto import (
     oqs,
     sanitize_on_shutdown
 )
-
 
 OQS_MISSING = (oqs is None)
 
@@ -64,9 +65,7 @@ class TestPqcCrypto(unittest.TestCase):
         )
 
     def tearDown(self):
-        """
-        Optionally test memory sanitize
-        """
+        # Optionally test memory sanitize
         sanitize_on_shutdown()
 
     def test_encrypt_decrypt_gcm(self):
@@ -120,7 +119,7 @@ class TestPqcCrypto(unittest.TestCase):
         self.assertTrue(payload["wrapped_key_kyber"])
         self.assertTrue(payload["wrapped_key_rsa"])
         self.assertTrue(payload["iv"])
-        self.assertTrue(payload["integrity"])  # CBC+HMAC => integrity stored
+        self.assertTrue(payload["integrity"])
         self.assertEqual(payload["auth_tag"], "")
 
         recovered = decrypt_file_payload(
@@ -147,7 +146,6 @@ class TestPqcCrypto(unittest.TestCase):
             kyber_pub=self.kyber_pub,
             rsa_pub=self.rsa_pub_pem
         )
-        # Should have empty wrapped_key_rsa
         self.assertEqual(payload["wrapped_key_rsa"], "")
 
         recovered = decrypt_file_payload(
@@ -158,7 +156,7 @@ class TestPqcCrypto(unittest.TestCase):
         )
         self.assertEqual(recovered, plaintext)
 
-        # Tamper with kyber => no RSA fallback => must fail
+        # Tamper with Kyber => no fallback => fail
         tampered = dict(payload)
         tampered["wrapped_key_kyber"] = base64.b64encode(b"junk").decode("utf-8")
         with self.assertRaises(CryptoDecryptionError):
@@ -180,8 +178,8 @@ class TestPqcCrypto(unittest.TestCase):
         tampered = dict(payload)
         ct_bytes = base64.b64decode(tampered["ciphertext"])
         ct_mutable = bytearray(ct_bytes)
-        ct_mutable[0] ^= 0xFF
-        tampered["ciphertext"] = base64.b64encode(bytes(ct_mutable)).decode("utf-8")
+        ct_mutable[0] ^= 0xFF  # flip a bit
+        tampered["ciphertext"] = base64.b64encode(ct_mutable).decode("utf-8")
 
         with self.assertRaises(CryptoDecryptionError):
             decrypt_file_payload(tampered, cfg, self.kyber_priv, self.rsa_priv_pem)
@@ -195,7 +193,7 @@ class TestPqcCrypto(unittest.TestCase):
         cfg = SentinelConfig(config_dict)
         data = b"Hello signature"
 
-        sigs = pqc_crypto.sign_content_bundle(data, cfg, self.dil_priv, self.rsa_priv_pem)
+        sigs = sign_content_bundle(data, cfg, self.dil_priv, self.rsa_priv_pem)
         self.assertTrue(sigs["dilithium"])
         self.assertTrue(sigs["rsa"])
         self.assertIn("signer_id", sigs["metadata"])
@@ -225,22 +223,18 @@ class TestPqcCrypto(unittest.TestCase):
         ok = verify_content_signature(data, sigs, cfg, self.dil_pub, self.rsa_pub_pem)
         self.assertTrue(ok)
 
-        # tamper
+        # Tamper
         ok2 = verify_content_signature(b"???", sigs, cfg, self.dil_pub, self.rsa_pub_pem)
         self.assertFalse(ok2)
 
     def test_rng_check(self):
-        """
-        Just ensure the validate_rng() runs without fatal error. If it logs a warning 
-        about identical blocks, it's extremely unlikely but not a fail for test.
-        """
-        # We'll mock os.urandom to produce same blocks, see if logs warning.
+        # Mock os.urandom to produce same blocks => logs warning
         with mock.patch("os.urandom", side_effect=[b"A"*32, b"A"*32]):
             with self.assertLogs(level="WARNING") as log_cm:
                 pqc_crypto.validate_rng()
             self.assertIn("RNG check: identical 32-byte blocks encountered", "".join(log_cm.output))
 
-        # normal => debug log
+        # Normal => logs debug
         with mock.patch("os.urandom", side_effect=[b"A"*32, b"B"*32]):
             with self.assertLogs(level="DEBUG") as log_cm:
                 pqc_crypto.validate_rng()
