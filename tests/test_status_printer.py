@@ -1,5 +1,6 @@
+# test_status_printer.py
 """
-Unit tests for aepok_sentinel/utils/status_printer.py (Final Shape)
+Unit tests for status_printer.py
 
 Validates:
  - gather_system_status returns the expected fields
@@ -19,7 +20,6 @@ from aepok_sentinel.utils.status_printer import (
 
 
 class TestStatusPrinter(unittest.TestCase):
-
     def setUp(self):
         self.config_dict = {
             "schema_version": 1,
@@ -28,7 +28,6 @@ class TestStatusPrinter(unittest.TestCase):
             "strict_transport": False,
             "cloud_keyvault_url": "https://fakevault.example",
             "daemon_poll_interval": 10,
-            "log_path": "/var/log/sentinel/",
             "allow_delete": False,
             "license_required": True,
             "bound_to_hardware": False
@@ -47,7 +46,6 @@ class TestStatusPrinter(unittest.TestCase):
         self.assertIn("Cloud KeyVault URL: https://fakevault.example", status_str)
         self.assertIn("allow_delete: False", status_str)
         self.assertIn("daemon_poll_interval: 10", status_str)
-        self.assertIn("Log path: /var/log/sentinel/", status_str)
         self.assertIn("License required: True", status_str)
         self.assertIn("Hardware binding: False", status_str)
 
