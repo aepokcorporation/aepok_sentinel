@@ -511,22 +511,33 @@ class AuditChain:
     # Internal merkle logic
     # ------------------------------
     def _build_in_memory_state(self):
+        """
+        Rebuilds Merkle state from audit_chain.log,
+        but halts if any line is corrupt, truncated, or incomplete.
+        """
         self.leaf_hashes.clear()
         self.tree_levels.clear()
         if not self.chain_file.is_file():
             return
+
         with open(self.chain_file, "r", encoding="utf-8") as chain_f:
             lines = chain_f.readlines()
-        for line_str in lines:
+
+        for line_num, line_str in enumerate(lines, start=1):
             line_str = line_str.strip()
             if not line_str:
                 continue
             try:
                 record = json.loads(line_str)
+                if "entry_hash" not in record:
+                    raise ValueError("Missing 'entry_hash' field")
                 entry_hash = record["entry_hash"]
                 self._insert_leaf_during_validation(entry_hash)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Corrupt or partial line in audit chain at line %d => %s", line_num, e)
+                raise ChainTamperDetectedError(
+                    f"Invalid or incomplete entry in audit_chain.log at line {line_num} => {e}"
+                )
 
     def _insert_leaf_during_validation(self, leaf_hash: str) -> None:
         if not self.tree_levels:
