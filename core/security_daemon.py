@@ -1,14 +1,19 @@
+# security_daemon.py
 """
-security_daemon.py
+Security Daemon
 
-Final-shape Security Daemon with:
- - Signed .hashes.json to ensure integrity ([20])
- - On tamper, logs old/new hash + size diff for forensics ([21])
- - Maintains a small rolling 'previous_hashes' to track replays ([22])
- - In inotify loop, if we exceed N consecutive errors => log chain event + stop ([23])
- - No silent directory creation. If quarantine_dir is missing => raise.
+Implements:
+ - A hash store (.hashes.json + signature) to track file integrity within Sentinel's "security" directory.
+ - Periodic or inotify-based scanning of configured paths, detecting tampered or malicious files.
+ - Quarantines (if enabled) or logs events if in watch-only mode.
+ - Integrates optional autoban logic if an intrusion source is detected in file metadata.
+ - Enforces no silent directory creation for quarantine; raises if missing.
 
-Integrates optional autoban logic if suspicious intrusion source metadata is found in file events.
+Usage:
+  from aepok_sentinel.core.security_daemon import SecurityDaemon
+
+  daemon = SecurityDaemon(config, license_mgr, audit_chain, ...)
+  daemon.start()   # blocks until stop() or fatal error
 """
 
 import os
@@ -40,31 +45,31 @@ class SecurityDaemonError(Exception):
 
 
 class FileTamperDetectedError(Exception):
-    """Raised if a file's hash mismatches the known store, prompting quarantine or watch-only log."""
+    """Raised when a file’s hash mismatches the stored hash, prompting quarantine or logs."""
 
 
 class SecurityDaemon:
     """
-    Daemon:
-      - Loads .hashes.json + .hashes.json.sig
-      - On mismatch => discard or ignore
-      - Checks tamper or malware => quarantines if not watch-only
-      - Records old/new hash + size diffs
-      - Integrates autoban if suspicious intrusion_source is detected
-      - uses inotify or poll loop
-      - on repeated inotify errors => logs chain event + stops
+    Monitors configured directories for file changes:
+      - Loads and signs a .hashes.json to track each file’s hash.
+      - In watch-only mode, we log tamper or malware but do not quarantine.
+      - If quarantining is enabled, tampered or malicious files are moved to quarantine.
+      - Attempts to identify intrusion sources in file names for potential autoban triggers.
+      - Supports inotify or poll-based scanning, and stops after exceeding max inotify errors.
     """
 
     MAX_INOTIFY_ERRORS = 5
 
-    def __init__(self,
-                 config: SentinelConfig,
-                 license_mgr: LicenseManager,
-                 audit_chain: AuditChain,
-                 hash_store_path: Path = resolve_path("security", ".hashes.json"),
-                 quarantine_dir: Path = resolve_path("quarantine"),
-                 sign_priv_key_path: Path = resolve_path("security", "daemon_dilithium_priv.bin"),
-                 autoban_mgr: AutobanManager):
+    def __init__(
+        self,
+        config: SentinelConfig,
+        license_mgr: LicenseManager,
+        audit_chain: AuditChain,
+        hash_store_path: Path = resolve_path("security", ".hashes.json"),
+        quarantine_dir: Path = resolve_path("quarantine"),
+        sign_priv_key_path: Path = resolve_path("security", "daemon_dilithium_priv.bin"),
+        autoban_mgr: Optional[AutobanManager] = None
+    ):
         self.config = config
         self.license_mgr = license_mgr
         self.audit_chain = audit_chain
@@ -72,63 +77,49 @@ class SecurityDaemon:
         self.quarantine_dir = quarantine_dir
         self.sign_priv_key_path = sign_priv_key_path
         self.autoban_mgr = autoban_mgr
-        
-        # ensure quarantine_dir exists
-        if not os.path.isdir(self.quarantine_dir):
+
+        if not self.quarantine_dir.is_dir():
             raise RuntimeError(f"Quarantine directory missing: {self.quarantine_dir}")
 
-        # load or create .hashes.json with signature
-        self._hash_store = {}
-        self._previous_hashes: Dict[str, list] = {}  # e.g. { filepath: [list_of_past_hashes] }
-        self._hash_seen_table: Dict[str, Dict[str, Any]] = {}  # SHA256 → { "count": N, "first_seen": str, "paths": set }
-                
+        self._hash_store: Dict[str, str] = {}
+        self._previous_hashes: Dict[str, list] = {}
+        self._hash_seen_table: Dict[str, Dict[str, Any]] = {}
+
+        # Load the signed hash store
         self._load_hash_store()
-        
         self._initialize_hash_seen_table()
 
-        # load malware DB
+        # Load malware DB
         self.malware_db = MalwareDatabase(config)
         try:
             self.malware_db.load_signatures()
         except MalwareDBError as e:
             logger.warning("Failed to load malware signatures: %s", e)
 
-        # watch-only => no quarantine
         self._stop_flag = threading.Event()
 
         self._use_inotify = bool(self.config.raw_dict.get("use_inotify", False))
         self._poll_interval = int(self.config.daemon_poll_interval)
 
-    def _initialize_hash_seen_table(self) -> None:
-        """
-        Populate _hash_seen_table from current _hash_store on startup.
-        """
-        now = datetime.datetime.utcnow().isoformat() + "Z"
-        for path, hval in self._hash_store.items():
-            if hval not in self._hash_seen_table:
-                self._hash_seen_table[hval] = {
-                    "count": 1,
-                    "first_seen": now,
-                    "paths": set([path])
-                }
-            else:
-                self._hash_seen_table[hval]["count"] += 1
-                self._hash_seen_table[hval]["paths"].add(path)
-
     def start(self) -> None:
         """
-        Main loop. Either inotify or poll, blocking until stop() or fatal error.
+        Runs the main loop: inotify-based if configured, else poll-based.
+        Blocks until stop() is called or a fatal error occurs.
         """
-        logger.info("SecurityDaemon start. watch_only=%s, inotify=%s",
-                    is_watch_only(self.license_mgr), self._use_inotify)
-
-        # AUDIT CHAIN ANCHOR FOR DAEMON STARTUP
-        self._log_chain_event(EventCode.DAEMON_STARTED, {
-            "mode": "inotify" if self._use_inotify else "poll",
-            "watch_only": str(is_watch_only(self.license_mgr)),
-            "enforcement_mode": getattr(self.config, "enforcement_mode", "unknown"),
-            "scan_paths": self.config.scan_paths
-        })
+        logger.info(
+            "SecurityDaemon start. watch_only=%s, inotify=%s",
+            is_watch_only(self.license_mgr),
+            self._use_inotify
+        )
+        self._log_chain_event(
+            EventCode.DAEMON_STARTED,
+            {
+                "mode": "inotify" if self._use_inotify else "poll",
+                "watch_only": str(is_watch_only(self.license_mgr)),
+                "enforcement_mode": getattr(self.config, "enforcement_mode", "unknown"),
+                "scan_paths": self.config.scan_paths
+            }
+        )
 
         if self._use_inotify:
             self._run_inotify_loop()
@@ -136,11 +127,12 @@ class SecurityDaemon:
             self._run_poll_loop()
 
     def stop(self) -> None:
+        """Requests shutdown of the main loop."""
         self._stop_flag.set()
 
-    # ------------------------------------------
+    # ------------------------------
     # Poll-based scanning
-    # ------------------------------------------
+    # ------------------------------
     def _run_poll_loop(self) -> None:
         scan_paths = self.config.scan_paths
         exclude_paths = self.config.exclude_paths
@@ -173,17 +165,16 @@ class SecurityDaemon:
                 if not recursive:
                     break
 
-    # ------------------------------------------
+    # ------------------------------
     # Inotify-based scanning
-    # ------------------------------------------
+    # ------------------------------
     def _run_inotify_loop(self) -> None:
         logger.info("Inotify loop started.")
         error_count = 0
         try:
             from inotify_simple import INotify, flags
-        except ImportError as e:
-            logger.error("inotify_simple not installed => cannot proceed. Fallback poll?")
-            # fallback
+        except ImportError:
+            logger.error("inotify_simple not installed => fallback to poll.")
             self._run_poll_loop()
             return
 
@@ -218,54 +209,49 @@ class SecurityDaemon:
                     error_count += 1
                     if error_count >= self.MAX_INOTIFY_ERRORS:
                         logger.error("Exceeded max inotify errors => halting daemon.")
-                        self._log_chain_event(EventCode.TAMPER_DETECTED,
-                                              {"reason": "inotify_loop_excessive_errors",
-                                               "error_count": str(error_count)})
+                        self._log_chain_event(
+                            EventCode.TAMPER_DETECTED,
+                            {
+                                "reason": "inotify_loop_excessive_errors",
+                                "error_count": str(error_count)
+                            }
+                        )
                         self.stop()
                         break
         logger.info("Inotify loop stopped gracefully.")
 
-    # ------------------------------------------
-    # File handling
-    # ------------------------------------------
+    # ------------------------------
+    # File event processing
+    # ------------------------------
     def _process_file(self, filepath: str) -> None:
         """
-        Process the file => detect tamper, malware, intrusion_source => possibly quarantine or watch-only log.
-        Always call autoban if intrusion_source is found, with no logic difference in watch-only vs normal mode.
+        Compares file hash to stored hash. Checks for tamper or malware. 
+        If intrusion_source is found, calls autoban. Quarantines if not watch-only and tamper/malware is detected.
         """
-        tamper, threat, meta = self._analyze_file(filepath)
-
-        # If an intrusion_source is present => call autoban
+        tampered, threat, meta = self._analyze_file(filepath)
         intrusion_source = meta.get("intrusion_source")
         if intrusion_source and self.autoban_mgr:
-            reason_str = f"{intrusion_source['type']}: {threat or 'tamper'}" if (tamper or threat) else intrusion_source['type']
+            reason_str = f"{intrusion_source['type']}:{threat or 'tamper'}" if (tampered or threat) else intrusion_source['type']
             self.autoban_mgr.record_bad_source(intrusion_source["value"], reason_str)
 
-        # watch-only => skip quarantine but still log chain events
+        # watch-only => skip quarantine, but log
         if is_watch_only(self.license_mgr):
-            if tamper:
-                # embed source_type/source_value in the metadata if intrusion_source
-                if intrusion_source:
-                    meta["source_type"] = intrusion_source["type"]
-                    meta["source_value"] = intrusion_source["value"]
+            if tampered:
                 self._log_chain_event(EventCode.TAMPER_DETECTED, meta)
             if threat:
-                malware_meta = {"file": filepath, "threat": threat}
+                mmeta = {"file": filepath, "threat": threat}
                 if intrusion_source:
-                    malware_meta["source_type"] = intrusion_source["type"]
-                    malware_meta["source_value"] = intrusion_source["value"]
-                self._log_chain_event(EventCode.MALWARE_MATCH, malware_meta)
+                    mmeta["source_type"] = intrusion_source["type"]
+                    mmeta["source_value"] = intrusion_source["value"]
+                self._log_chain_event(EventCode.MALWARE_MATCH, mmeta)
             return
 
-        # normal => we can quarantine
-        if tamper or threat:
+        # normal => quarantine or log
+        if tampered or threat:
             if self.config.quarantine_enabled:
-                self._quarantine_file(filepath, tamper, threat, meta)
+                self._quarantine_file(filepath, tampered, threat, meta)
             else:
-                if tamper:
-                    if intrusion_source:
-                        meta["source_type"] = intrusion_source["type"]
-                        meta["source_value"] = intrusion_source["value"]
+                if tampered:
                     self._log_chain_event(EventCode.TAMPER_DETECTED, meta)
                 if threat:
                     mmeta = {"file": filepath, "threat": threat}
@@ -274,22 +260,15 @@ class SecurityDaemon:
                         mmeta["source_value"] = intrusion_source["value"]
                     self._log_chain_event(EventCode.MALWARE_MATCH, mmeta)
         else:
-            # update hash
             self._update_file_hash(filepath)
 
     def _analyze_file(self, filepath: str) -> (bool, Optional[str], Dict[str, Any]):
-        """
-        Returns (tampered, threat_name, metadata).
-        We gather old/new hash + size deltas, or if file reverts to old hash => note it.
-        Also attaches intrusion_source from _get_intrusion_source_for_file().
-        """
         new_hash = self._compute_sha256(filepath)
-        old_hash = self._hash_store.get(filepath, None)
+        old_hash = self._hash_store.get(filepath)
         metadata = {"file": filepath, "new_hash": new_hash}
         new_size = os.path.getsize(filepath)
         metadata["new_size"] = str(new_size)
 
-        # gather intrusion metadata
         intrusion = self._get_intrusion_source_for_file(filepath)
         if intrusion:
             metadata["intrusion_source"] = intrusion
@@ -303,33 +282,27 @@ class SecurityDaemon:
                 metadata["old_size"] = str(old_size)
                 diff = new_size - old_size
                 metadata["size_diff"] = str(diff)
-
-            # anti-replay check
             if filepath in self._previous_hashes and new_hash in self._previous_hashes[filepath]:
                 metadata["replay_detected"] = "true"
 
-        # check malware
         threat = self.malware_db.check_file(filepath)
-
         return tampered, threat, metadata
 
-    def _quarantine_file(self, filepath: str, tampered: bool, threat_name: Optional[str], meta: dict) -> None:
-        """
-        Moves file to quarantine, logs event with old/new hash or threat details, plus intrusion source if any.
-        """
-        bn = Path(filepath).name
-        q_path = self.quarantine_dir / bn
+    def _quarantine_file(self, filepath: str, tampered: bool, threat_name: Optional[str], meta: Dict[str, Any]) -> None:
+        basename = Path(filepath).name
+        q_path = self.quarantine_dir / basename
         i = 0
         while q_path.exists():
             i += 1
-            q_path = self.quarantine_dir / f"{bn}.{i}"
+            q_path = self.quarantine_dir / f"{basename}.{i}"
+
         try:
             shutil.move(filepath, q_path)
         except Exception as e:
             logger.error("Failed to quarantine file %s => %s", filepath, e)
             return
 
-        meta["quarantine_path"] = q_path
+        meta["quarantine_path"] = str(q_path)
         if threat_name:
             meta["threat"] = threat_name
         if tampered:
@@ -347,16 +320,14 @@ class SecurityDaemon:
                 self._previous_hashes[filepath].append(old_hash)
 
         self._hash_store[filepath] = new_hash
-
-        # Update global seen table
         now = datetime.datetime.utcnow().isoformat() + "Z"
         seen_entry = self._hash_seen_table.get(new_hash)
         if seen_entry:
             seen_entry["count"] += 1
+            new_path_added = (filepath not in seen_entry["paths"])
             seen_entry["paths"].add(filepath)
-
-            # If new path seen with same hash => potential replay reuse
-            if filepath not in seen_entry["paths"]:
+            if new_path_added:
+                # Possibly the same hash is reused in a new path => replay reuse detection
                 self._log_chain_event("REPLAY_REUSE_DETECTED", {
                     "sha256": new_hash,
                     "new_path": filepath,
@@ -373,18 +344,8 @@ class SecurityDaemon:
 
         self._save_hash_store()
 
-    # ------------------------------------------
-    # Intrusion source detection
-    # ------------------------------------------
-    def _get_intrusion_source_for_file(self, filepath: str) -> dict:
-        """
-        Returns a dict { "type": <str>, "value": <str> } for final-shape intrusion metadata.
-        We handle "ip", "mac", "usb", "device", "hostname", "process" by naive heuristics below.
-        This is final-shape code, no placeholders or partial logic.
-        """
+    def _get_intrusion_source_for_file(self, filepath: str) -> Optional[Dict[str, str]]:
         base = os.path.basename(filepath).lower()
-
-        # naive detection from filename patterns or mount checks
         if base.startswith("usb_"):
             return {"type": "usb", "value": f"usb:{base}"}
         elif base.startswith("mac_"):
@@ -396,12 +357,9 @@ class SecurityDaemon:
         elif base.startswith("proc_"):
             return {"type": "process", "value": f"proc:{base}"}
         else:
-            # fallback => treat as ip
+            # fallback => treat as IP
             return {"type": "ip", "value": f"{base}"}
 
-    # ------------------------------------------
-    # Exclusions, hashing, chain logging
-    # ------------------------------------------
     def _excluded_path(self, path: str, excludes: list) -> bool:
         for e in excludes:
             if path.startswith(e):
@@ -409,17 +367,12 @@ class SecurityDaemon:
         return False
 
     def _load_hash_store(self) -> None:
-        """
-        Load .hashes.json plus .hashes.json.sig if present. Verify signature.
-        If fail => discard.
-        """
-        if not os.path.isfile(self.hash_store_path):
+        if not self.hash_store_path.is_file():
             return
         sig_path = self.hash_store_path.with_suffix(".json.sig")
-        if not os.path.isfile(sig_path):
+        if not sig_path.is_file():
             logger.warning("Hash store signature missing => ignoring existing store.")
             return
-
         try:
             content_str = None
             with open(self.hash_store_path, "r", encoding="utf-8") as f:
@@ -430,24 +383,19 @@ class SecurityDaemon:
             with open(self.sign_priv_key_path, "rb") as kf:
                 dil_priv = kf.read()
 
-            import base64
-            import json as j
-            sig_json_bytes = base64.b64decode(sig_bytes)
-            sig_dict = j.loads(sig_json_bytes.decode("utf-8"))
-
-            from aepok_sentinel.core.pqc_crypto import verify_content_signature
+            import base64, json as j
+            sig_dict = j.loads(base64.b64decode(sig_bytes).decode("utf-8"))
             if not verify_content_signature(content_str.encode("utf-8"), sig_dict, self.config, dil_priv, None):
                 logger.warning("Hash store signature invalid => ignoring.")
                 return
 
             data = json.loads(content_str)
             if not isinstance(data, dict):
-                logger.warning(".hashes.json is not a dict => ignoring.")
+                logger.warning(".hashes.json invalid => ignoring.")
                 return
-
             store = data.get("hashes", {})
             if not isinstance(store, dict):
-                logger.warning("No 'hashes' dict in store => ignoring.")
+                logger.warning("No 'hashes' dict found => ignoring.")
                 return
             hist = data.get("previous_hashes", {})
             if not isinstance(hist, dict):
@@ -455,19 +403,14 @@ class SecurityDaemon:
 
             self._hash_store = store
             self._previous_hashes = hist
-            logger.info("Loaded signed .hashes.json with %d entries, plus history.",
-                        len(self._hash_store))
-
+            logger.info("Loaded signed .hashes.json with %d entries + history.", len(self._hash_store))
         except Exception as e:
             logger.warning("Failed to load .hashes.json or signature: %s", e)
 
     def _save_hash_store(self) -> None:
-        """
-        Save self._hash_store + self._previous_hashes as one object + sign it.
-        """
         try:
-            dpath = os.path.dirname(self.hash_store_path)
-            if not os.path.isdir(dpath):
+            dpath = self.hash_store_path.parent
+            if not dpath.is_dir():
                 raise RuntimeError(f"Hash store directory missing: {dpath}")
 
             combined_data = {
@@ -484,13 +427,24 @@ class SecurityDaemon:
 
             import json as j
             import base64
-            sig_json_bytes = j.dumps(sig_bundle).encode("utf-8")
-            sig_b64 = base64.b64encode(sig_json_bytes)
-
-            with open(self.hash_store_path + ".sig", "wb") as sf:
+            sig_b64 = base64.b64encode(j.dumps(sig_bundle).encode("utf-8"))
+            with open(f"{self.hash_store_path}.sig", "wb") as sf:
                 sf.write(sig_b64)
         except Exception as e:
             logger.warning("Failed to save or sign .hashes.json: %s", e)
+
+    def _initialize_hash_seen_table(self) -> None:
+        now = datetime.datetime.utcnow().isoformat() + "Z"
+        for path, hval in self._hash_store.items():
+            if hval not in self._hash_seen_table:
+                self._hash_seen_table[hval] = {
+                    "count": 1,
+                    "first_seen": now,
+                    "paths": set([path])
+                }
+            else:
+                self._hash_seen_table[hval]["count"] += 1
+                self._hash_seen_table[hval]["paths"].add(path)
 
     def _compute_sha256(self, filepath: str) -> str:
         sha = hashlib.sha256()
@@ -501,9 +455,8 @@ class SecurityDaemon:
 
     def _file_size_cache(self, path: str) -> Optional[int]:
         """
-        Return the stored old size from .hash_store if available,
-        or None if not stored. For final shape, we skip storing size in the store.
-        We'll do partial only.
+        We do not store file sizes in .hashes.json in this final shape.
+        If needed, we could track them. For now returns None.
         """
         return None
 
