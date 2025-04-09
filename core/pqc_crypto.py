@@ -133,11 +133,13 @@ def encrypt_file_payload(
 
     # 2) Optional RSA fallback if not in strict/hardened
     wrapped_rsa = b""
-    fallback_allowed = (
-        config.allow_classical_fallback and
-        rsa_pub is not None and
-        not (config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"))
-    )
+    fallback_allowed = False
+    if config.allow_classical_fallback and rsa_pub:
+        if config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"):
+            logger.warning("Fallback explicitly disallowed: strict_transport or enforcement mode enforced.")
+        else:
+            fallback_allowed = True
+            
     if fallback_allowed:
         try:
             rsa_public_key = _load_rsa_public_key(rsa_pub)
@@ -434,12 +436,13 @@ def verify_content_signature(
 
     # RSA fallback if included and allowed
     rsa_sig_b64 = signatures.get("rsa", "")
-    fallback_allowed = (
-        config.allow_classical_fallback and
-        rsa_pub is not None and
-        rsa_sig_b64 and
-        not (config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"))
-    )
+    fallback_allowed = False
+    if config.allow_classical_fallback and rsa_pub:
+        if config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"):
+            logger.warning("Fallback explicitly disallowed: strict_transport or enforcement mode enforced.")
+        else:
+            fallback_allowed = True
+            
     if fallback_allowed:
         try:
             rsa_sig = base64.b64decode(rsa_sig_b64)
