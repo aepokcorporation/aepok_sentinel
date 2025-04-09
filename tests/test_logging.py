@@ -1,3 +1,10 @@
+# test_logging.py
+"""
+Tests for logging_setup.py, confirming that rotating file handling,
+JSON formatting, console suppression in SCIF mode, and audit-chain
+events on rollover all function correctly.
+"""
+
 import os
 import json
 import shutil
@@ -18,9 +25,9 @@ from aepok_sentinel.core.logging_setup import (
 
 
 class TestLoggingSetup(unittest.TestCase):
-
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
+        # Reset module-level logging flags/handlers
         global _LOGGING_INITIALIZED, _FILE_HANDLER, _CONSOLE_HANDLER
         _LOGGING_INITIALIZED = False
         _FILE_HANDLER = None
@@ -33,13 +40,11 @@ class TestLoggingSetup(unittest.TestCase):
     @patch("aepok_sentinel.core.logging_setup.audit_chain.append_event")
     def test_basic_logging(self, mock_append_event, mock_resolve_path):
         """
-        Validate basic JSON logging with directory_contract and no rollover triggered.
+        Validate basic JSON logging with directory_contract
+        and confirm no rollover triggered in a normal scenario.
         """
-        # Mock directory_contract to return our temp logs dir for "logs"
         logs_path = Path(self.temp_dir)
         mock_resolve_path.return_value = logs_path
-
-        # Ensure logs dir exists
         os.mkdir(logs_path)
 
         init_logging(
@@ -73,7 +78,7 @@ class TestLoggingSetup(unittest.TestCase):
     def test_rotation_with_chain_event(self, mock_append_event, mock_resolve_path):
         """
         Force rollover and confirm that 'LOG_ROTATED' is appended to the new log file
-        AND appended to the audit chain.
+        and appended to the audit chain.
         """
         logs_path = Path(self.temp_dir)
         mock_resolve_path.return_value = logs_path
@@ -88,6 +93,7 @@ class TestLoggingSetup(unittest.TestCase):
         )
         logger = get_logger("rotate_test")
 
+        # Produce enough log lines to trigger rotation
         for i in range(20):
             logger.info(f"Line {i}")
 
@@ -118,7 +124,7 @@ class TestLoggingSetup(unittest.TestCase):
     @patch("aepok_sentinel.core.logging_setup.resolve_path")
     def test_missing_logs_directory(self, mock_resolve_path):
         """
-        If 'logs' directory doesn't exist, raise LoggingSetupError.
+        If the 'logs' directory doesn't exist, raise LoggingSetupError.
         """
         mock_resolve_path.return_value = Path(self.temp_dir) / "missing_logs"
 
@@ -133,13 +139,14 @@ class TestLoggingSetup(unittest.TestCase):
     @patch("aepok_sentinel.core.logging_setup.resolve_path")
     def test_scif_mode_suppression(self, mock_resolve_path):
         """
-        In SCIF mode, console logs are off unless debug_console and manual_override_allowed.
+        In SCIF mode, console logs are off unless debug_console=True
+        and manual_override_allowed=True.
         """
         logs_path = Path(self.temp_dir)
         mock_resolve_path.return_value = logs_path
         os.mkdir(logs_path)
 
-        # scif_mode=True, debug_console=False => no console
+        # scif_mode=True, debug_console=False => console off
         init_logging(
             scif_mode=True,
             manual_override_allowed=False,
