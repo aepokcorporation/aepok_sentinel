@@ -39,7 +39,7 @@ from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, LicenseError
 from aepok_sentinel.core.key_manager import KeyManager
 from aepok_sentinel.core.audit_chain import AuditChain
-from aepok_sentinel.core.directory_contract import resolve_path
+from aepok_sentinel.core.directory_contract import resolve_path, SENTINEL_RUNTIME_BASE
 from aepok_sentinel.core.pqc_crypto import sign_content_bundle, CryptoSignatureError, oqs
 from aepok_sentinel.core.constants import EventCode
 
@@ -66,13 +66,12 @@ class ProvisionDevice:
 
     def __init__(self, runtime_base: str, audit_chain: AuditChain):
         """
-        :param runtime_base: The base runtime path (SENTINEL_RUNTIME_BASE)
         :param audit_chain: Pre-initialized AuditChain for logging events
         """
-        self.runtime_base = Path(runtime_base)
+        self.runtime_base = SENTINEL_RUNTIME_BASE
         self.audit_chain = audit_chain
 
-        # Build paths under runtime using resolve_path
+        # All paths resolved under contract
         self._provision_flag_path = resolve_path("provisioning_complete.flag")
         self._sentinelrc_path = resolve_path("config", ".sentinelrc")
         self._license_path = resolve_path("license", "license.key")
@@ -80,7 +79,7 @@ class ProvisionDevice:
         self._trust_anchor_path = resolve_path("config", "trust_anchor.json")
         self._keys_dir = resolve_path("keys")
         self._installer_key_path = resolve_path("keys", "installer_dilithium_priv.bin")
-
+        
         self._vendor_dil_priv: bytes = b""
         self._vendor_dil_pub: bytes = b""
         self._license_mgr: Optional[LicenseManager] = None
