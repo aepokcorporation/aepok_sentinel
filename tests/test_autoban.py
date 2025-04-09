@@ -1,11 +1,12 @@
+# test_autoban.py
 """
-Unit tests for aepok_sentinel/core/autoban.py (Final Shape)
+Unit tests for autoban.py
 
-Covering:
+Covers:
  - record_bad_source => actual firewall block unless watch-only or disabled
  - signature-based blocklist load/save
  - TTL expiration
- - verified firewall command path & hashing
+ - Verified firewall command path & hashing
 """
 
 import os
@@ -13,7 +14,7 @@ import unittest
 import tempfile
 import shutil
 import time
-from unittest.mock import patch, MagicMock, mock_open
+from unittest.mock import patch, MagicMock
 
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, LicenseState
@@ -27,7 +28,6 @@ class TestAutobanManager(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
         self.blocklist_file = os.path.join(self.temp_dir, "blocked_ips.json")
-        # create the directory if needed
         os.makedirs(self.temp_dir, exist_ok=True)
 
         self.config_dict = {
@@ -40,6 +40,7 @@ class TestAutobanManager(unittest.TestCase):
         self.license_mgr = LicenseManager(self.cfg)
         self.license_mgr.license_state = LicenseState(valid=True, watch_only=False, info={})
         self.audit_chain = AuditChain(chain_dir=self.temp_dir)
+
         self.ab = AutobanManager(
             config=self.cfg,
             license_mgr=self.license_mgr,
@@ -59,12 +60,11 @@ class TestAutobanManager(unittest.TestCase):
         self.ab.record_bad_source("1.2.3.4", "testing")
         self.assertTrue(self.ab.is_blocked("1.2.3.4"))
 
-        # ensure blocklist file was saved + sig
+        # blocklist + signature should exist
         sig_path = self.blocklist_file + ".sig"
         self.assertTrue(os.path.isfile(self.blocklist_file))
         self.assertTrue(os.path.isfile(sig_path))
 
-        # check chain => AUTOBAN_TRIGGERED
         chain_file = self.audit_chain.current_file_path
         with open(chain_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -72,24 +72,22 @@ class TestAutobanManager(unittest.TestCase):
 
     def test_autoban_disabled(self):
         self.ab.autoban_enabled = False
-        self.ab.record_bad_source("9.8.7.6", "disabled")
+        self.ab.record_bad_source("9.8.7.6", "disabled test")
         self.assertFalse(self.ab.is_blocked("9.8.7.6"))
 
     def test_watch_only(self):
         self.license_mgr.license_state.watch_only = True
         with patch.object(self.ab, "enforce_block") as mock_block:
-            self.ab.record_bad_source("2.3.4.5", "test")
+            self.ab.record_bad_source("2.3.4.5", "test watch_only")
             mock_block.assert_not_called()
         self.assertFalse(self.ab.is_blocked("2.3.4.5"))
 
     def test_block_ttl_expired(self):
-        # manually add a source w/ an old blocked_on
-        old_ts = int(time.time()) - (2*86400)  # 2 days ago
+        # manually add a source blocked 2 days ago
+        old_ts = int(time.time()) - (2 * 86400)
         self.ab.blocked_data["10.0.0.1"] = {"blocked_on": str(old_ts)}
-        # save
         self.ab._save_blocklist()
 
-        # re-init manager => should purge
         with patch.object(self.ab, "enforce_unblock") as mock_unblock:
             new_ab = AutobanManager(
                 config=self.cfg,
@@ -120,7 +118,6 @@ class TestAutobanManager(unittest.TestCase):
             self.ab.record_bad_source("8.8.8.8", "nofw")
 
     def test_missing_dir_raises(self):
-        # if user tries a non-existent path
         bad_file = os.path.join(self.temp_dir, "nonexist_dir", "blocked.json")
         with self.assertRaises(RuntimeError):
             AutobanManager(self.cfg, self.license_mgr, self.audit_chain, blocklist_file=bad_file)
