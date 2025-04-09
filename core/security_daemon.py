@@ -430,9 +430,23 @@ class SecurityDaemon:
             sig_b64 = base64.b64encode(j.dumps(sig_bundle).encode("utf-8"))
             with open(f"{self.hash_store_path}.sig", "wb") as sf:
                 sf.write(sig_b64)
+
         except Exception as e:
             logger.warning("Failed to save or sign .hashes.json: %s", e)
+            if self.audit_chain:
+                try:
+                    self.audit_chain.append_event("HASH_STORE_WRITE_FAIL", {
+                        "path": str(self.hash_store_path),
+                        "error": str(e)
+                    })
+                except Exception as chain_ex:
+                    logger.error("Failed to emit HASH_STORE_WRITE_FAIL to audit chain: %s", chain_ex)
 
+            if not is_watch_only(self.license_mgr) and self.config.quarantine_enabled:
+                logger.warning("Enforcing fallback: all scan targets will be quarantined on next pass.")
+                # Clear the hash store to trigger tamper detection on all future files
+                self._hash_store.clear()
+                
     def _initialize_hash_seen_table(self) -> None:
         now = datetime.datetime.utcnow().isoformat() + "Z"
         for path, hval in self._hash_store.items():
