@@ -256,13 +256,13 @@ def decrypt_file_payload(
             secure_zero(bytearray(shared_secret))
 
     # 2) RSA fallback if allowed
-    fallback_allowed = (
-        kyber_failed and
-        config.allow_classical_fallback and
-        rsa_priv is not None and
-        wrapped_rsa and
-        not (config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"))
-    )
+    fallback_allowed = False
+    if kyber_failed and config.allow_classical_fallback and rsa_priv and wrapped_rsa:
+        if config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"):
+            logger.warning("RSA fallback blocked due to strict enforcement.")
+        else:
+            fallback_allowed = True
+            
     if fallback_allowed:
         logger.info("Attempting RSA fallback.")
         try:
@@ -371,11 +371,13 @@ def sign_content_bundle(
 
     # RSA sign fallback if allowed
     rsa_sign_b64 = ""
-    fallback_allowed = (
-        config.allow_classical_fallback and
-        rsa_priv is not None and
-        not (config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"))
-    )
+    fallback_allowed = False
+    if config.allow_classical_fallback and rsa_pub:
+        if config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"):
+            logger.warning("Fallback explicitly disallowed: strict_transport or enforcement mode enforced.")
+        else:
+            fallback_allowed = True
+            
     if fallback_allowed:
         try:
             private_key = _load_rsa_private_key(rsa_priv)
