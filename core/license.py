@@ -1,6 +1,6 @@
 # aepok_sentinel/core/license.py
 """
-License Management (Final-Shape)
+License Management
 
 Responsibilities:
  - Load and verify a license (stored as a base64-encoded JSON blob in 'license.key').
