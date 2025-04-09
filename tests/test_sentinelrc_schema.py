@@ -1,5 +1,6 @@
+# test_sentinelrc_schema.py
 """
-Unit tests for aepok_sentinel/utils/sentinelrc_schema.py (Final Shape)
+Unit tests for sentinelrc_schema.py
 
 Checks:
  - Missing required fields => ValueError
@@ -13,12 +14,13 @@ Checks:
 import unittest
 
 from aepok_sentinel.utils.sentinelrc_schema import (
-    validate_sentinelrc, DEFAULTS, REQUIRED_FIELDS
+    validate_sentinelrc,
+    DEFAULTS,
+    REQUIRED_FIELDS
 )
 
 
 class TestSentinelrcSchema(unittest.TestCase):
-
     def test_missing_required_fields(self):
         raw = {}
         with self.assertRaises(ValueError) as ctx:
@@ -46,6 +48,7 @@ class TestSentinelrcSchema(unittest.TestCase):
         # Some known defaults
         self.assertFalse(final["allow_delete"])
         self.assertEqual(final["tls_mode"], "hybrid")
+        self.assertFalse(final["allow_unknown_keys"])
 
     def test_unknown_keys_disallowed(self):
         raw = {
@@ -66,7 +69,7 @@ class TestSentinelrcSchema(unittest.TestCase):
         }
         final = validate_sentinelrc(raw)
         self.assertTrue(final["allow_unknown_keys"])
-        # no error => pass
+        # No error => pass
 
     def test_tls_mode_invalid(self):
         raw = {
