@@ -379,6 +379,14 @@ class ProvisionDevice:
         if missing_required or not (has_kyber and has_dil):
             raise ProvisionError(f"trust_anchor missing files => missing={missing_required}, kyber={has_kyber}, dil={has_dil}")
 
+        try:
+            identity_bytes = self._identity_path.read_bytes()
+            identity_hash = hashlib.sha256(identity_bytes).hexdigest()
+            anchor_obj["identity_json_sha256"] = identity_hash
+        except Exception as e:
+            logger.exception("Failed to compute identity.json SHA-256 for trust anchor binding.")
+            raise ProvisionError(f"Cannot bind identity.json to trust_anchor: {e}")
+
         anchor_json = json.dumps(anchor_obj, indent=2)
         dir_path = self._trust_anchor_path.parent
         if not dir_path.is_dir():
