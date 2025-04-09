@@ -1,8 +1,9 @@
+# test_constants.py
 """
-Unit tests for aepok_sentinel/core/constants.py
+Unit tests for constants.py
 
-Checks:
- - EventCode enum presence (including new intrusion codes)
+Verifies:
+ - EventCode enum presence (including intrusion/autoban codes)
  - Basic global constants
 """
 
@@ -15,13 +16,12 @@ from aepok_sentinel.core.constants import (
 )
 
 class TestConstants(unittest.TestCase):
-
     def test_event_code_enum(self):
         # Basic presence checks
         self.assertEqual(EventCode.CHAIN_BROKEN.value, "CHAIN_BROKEN")
         self.assertEqual(EventCode.FILE_ENCRYPTED.value, "FILE_ENCRYPTED")
 
-        # Check the newly added intrusion codes
+        # Check the intrusion codes
         self.assertEqual(EventCode.SOURCE_BLOCKED.value, "SOURCE_BLOCKED")
         self.assertEqual(EventCode.SOURCE_REJECTED.value, "SOURCE_REJECTED")
         self.assertEqual(EventCode.AUTOBAN_TRIGGERED.value, "AUTOBAN_TRIGGERED")
