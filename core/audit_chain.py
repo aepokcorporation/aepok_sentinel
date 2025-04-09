@@ -195,7 +195,7 @@ class AuditChain:
                 merkle_path = self._compute_merkle_path(leaf_idx)
                 record["merkle_path"] = merkle_path
 
-                # Sign if we have private keys
+                # Sign if keys are present
                 record["signature"] = ""
                 if self.pqc_priv_keys.get("dilithium"):
                     data_bytes = json.dumps(record, sort_keys=True).encode("utf-8")
@@ -207,19 +207,28 @@ class AuditChain:
                     )
                     record["signature"] = base64.b64encode(json.dumps(sig_bundle).encode("utf-8")).decode("utf-8")
 
-                # Write to .chain_tmp, then append
+                # Write to .chain_tmp first
                 tmp_data = json.dumps(record) + "\n"
                 with open(self.chain_tmp, "w", encoding="utf-8") as tmp_f:
                     tmp_f.write(tmp_data)
                     tmp_f.flush()
                     os.fsync(tmp_f.fileno())
 
+                # Read it back and confirm we can write it to chain
                 with open(self.chain_tmp, "r", encoding="utf-8") as tmp_f:
                     contents = tmp_f.read()
-                chain_f.write(contents)
 
-                # Update in-memory
+                try:
+                    chain_f.write(contents)
+                    chain_f.flush()
+                    os.fsync(chain_f.fileno())
+                except Exception as e:
+                    logger.error("Failed to write to audit_chain.log => skipping Merkle update: %s", e)
+                    return  # Prevent in-memory desync
+
+                # Only now update in-memory state
                 self._insert_new_leaf(entry_hash)
+
             finally:
                 _unlock_file(chain_f)
 
