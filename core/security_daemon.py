@@ -418,6 +418,11 @@ class SecurityDaemon:
                 "previous_hashes": self._previous_hashes
             }
             content_str = json.dumps(combined_data, indent=2)
+            
+            tmp_hash_path = self.hash_store_path.with_suffix(".json.tmp")
+            tmp_sig_path = self.hash_store_path.with_suffix(".json.sig.tmp")
+            final_sig_path = self.hash_store_path.with_suffix(".json.sig")
+            
             with open(self.hash_store_path, "w", encoding="utf-8") as f:
                 f.write(content_str)
 
@@ -430,6 +435,9 @@ class SecurityDaemon:
             sig_b64 = base64.b64encode(j.dumps(sig_bundle).encode("utf-8"))
             with open(f"{self.hash_store_path}.sig", "wb") as sf:
                 sf.write(sig_b64)
+
+            os.replace(tmp_hash_path, self.hash_store_path)
+            os.replace(tmp_sig_path, final_sig_path)
 
         except Exception as e:
             logger.warning("Failed to save or sign .hashes.json: %s", e)
