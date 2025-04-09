@@ -1,13 +1,9 @@
+# constants.py
 """
-constants.py
-
 Contains:
  - EventCode enum for standardized audit/log events
  - Intrusion/autoban event codes
- - Other global constants (no directory creation or path usage here).
- 
-Flaw [70] fix: added SOURCE_BLOCKED, SOURCE_REJECTED, AUTOBAN_TRIGGERED event codes.
-No references to future logic modules or directory creation.
+ - Other global constants shared across modules
 """
 
 from enum import Enum, unique
@@ -42,7 +38,7 @@ class EventCode(Enum):
     TLS_FALLBACK = "TLS_FALLBACK"
     TLS_STRICT_FAIL = "TLS_STRICT_FAIL"
 
-    # [70] Intrusion / Autoban events
+    # Intrusion / Autoban events
     SOURCE_BLOCKED = "SOURCE_BLOCKED"
     SOURCE_REJECTED = "SOURCE_REJECTED"
     AUTOBAN_TRIGGERED = "AUTOBAN_TRIGGERED"
