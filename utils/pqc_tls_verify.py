@@ -1,111 +1,112 @@
+# pqc_tls_verify.py
 """
-pqc_tls_verify.py (Final Shape)
-
 Utilities for verifying PQC/hybrid TLS sessions:
- - verify_negotiated_pqc(tls_sock, config) -> bool
-   Checks if the negotiated group is valid given config.tls_mode, strict_transport, etc.
- - get_server_cert_fingerprint(tls_sock) -> str
-   Retrieves the server certificate from TLS, returns SHA-256 fingerprint (hex).
- - verify_cert_fingerprint(tls_sock, expected_fp) -> bool
-   Compares actual vs. expected cert fingerprint.
- - check_session_resumption(tls_sock) -> bool
-   Detects if session was resumed; for logging or disallowing replay.
- - log_tls_verification_event(tls_sock, config, event="TLS_VERIFICATION")
-   Writes group name, cert fingerprint, PQC mode to the audit chain.
 
-Addresses:
- - [33] Real group check from PQC TLS
- - [34] Cert fingerprint logging + PQC state => audit chain
- - [35] Session ticket/resumption tracking (no session ticket usage is recommended,
-        but we can detect if a resumed session was used)
+ - verify_negotiated_pqc(tls_sock, config) -> bool
+   Checks if the negotiated TLS group meets the config.tls_mode requirements.
+
+ - get_server_cert_fingerprint(tls_sock) -> str
+   Retrieves the server certificate from the TLS socket and returns its SHA-256 fingerprint (hex).
+
+ - verify_cert_fingerprint(tls_sock, expected_fp) -> bool
+   Compares the actual certificate fingerprint with an expected one, returning False if mismatched.
+
+ - check_session_resumption(tls_sock) -> bool
+   Attempts to detect if the TLS session was resumed.
+
+ - log_tls_verification_event(tls_sock, config, event="TLS_VERIFICATION")
+   Writes an event to the audit chain with negotiated group, certificate fingerprint, PQC mode, etc.
 """
 
 import ssl
 import hashlib
 import logging
-
 from typing import Optional
+
 from aepok_sentinel.core.config import SentinelConfig
-from aepok_sentinel.core.pqc_tls import _get_negotiated_group  # real OpenSSL group retrieval
+from aepok_sentinel.core.pqc_tls import _get_negotiated_group
 from aepok_sentinel.core import audit_chain
 
 logger = logging.getLogger(__name__)
 
 
 class PQCVerifyError(Exception):
-    """Raised if PQC or certificate verification fails."""
+    """
+    Raised if PQC or certificate verification fails. (Reserved for future usage)
+    """
 
 
 def verify_negotiated_pqc(tls_sock: ssl.SSLSocket, config: SentinelConfig) -> bool:
     """
-    Checks if the TLS socket's negotiated group meets the config.tls_mode requirements:
-     - pqc-only => must contain 'kyber' (naive check)
-     - hybrid => if strict_transport => must contain 'kyber', else classical is allowed
-     - classical => always pass
-    Returns True if it meets the policy, False otherwise.
+    Checks if the TLS socket's negotiated group aligns with config.tls_mode:
+      - "pqc-only": Must contain 'kyber' in the negotiated group name.
+      - "hybrid":
+         * If strict_transport=True => must contain 'kyber',
+         * otherwise classical fallback is allowed.
+      - "classical": Always accepted (even if strict_transport is set).
+      - If the group is unknown and strict_transport=True, we reject.
+
+    Returns True if the policy is satisfied, or False otherwise.
     """
     group_name = _get_negotiated_group(tls_sock) or "unknown_group"
     logger.info("verify_negotiated_pqc: group=%s, tls_mode=%s, strict=%s",
                 group_name, config.tls_mode, config.strict_transport)
-    
+
     if group_name == "unknown_group" and config.strict_transport:
         logger.warning("STRICT mode but negotiated group is unknown => reject")
         return False
 
     mode = config.tls_mode.lower()
     if mode == "classical":
-        # Even if strict_transport is set, user has a contradictory config. We'll return True for classical mode.
+        # Even if strict_transport is set, user config is contradictory, but we accept classical.
         if config.strict_transport:
-            logger.warning("Config: classical + strict => contradictory, but accepting classical.")
+            logger.warning("Config mismatch: classical + strict_transport => allowing classical.")
         return True
 
     if mode == "pqc-only":
         if "kyber" not in group_name.lower():
-            logger.warning("PQC-only mode => group=%s is not PQC", group_name)
+            logger.warning("PQC-only mode => group=%s is not PQC-based", group_name)
             return False
         return True
 
     if mode == "hybrid":
         if config.strict_transport:
-            # require 'kyber'
             if "kyber" not in group_name.lower():
                 logger.warning("strict_transport + hybrid => expected PQC group, got '%s'", group_name)
                 return False
             return True
-        else:
-            # non-strict => allow fallback
-            return True
+        # non-strict => classical fallback allowed
+        return True
 
-    # fallback => unknown or mis-labeled. Let's just pass
-    logger.warning("tls_mode=%s is unrecognized. Accepting group=%s", mode, group_name)
+    # If tls_mode is not recognized, log a warning and accept.
+    logger.warning("Unrecognized tls_mode=%s => accepting group=%s", mode, group_name)
     return True
 
 
 def get_server_cert_fingerprint(tls_sock: ssl.SSLSocket) -> str:
     """
-    Returns SHA-256 hex fingerprint of server's DER certificate. 
-    Empty string if no cert is present.
+    Returns the SHA-256 hex fingerprint of the server's DER certificate.
+    If no certificate is present, returns an empty string.
     """
     der_cert = tls_sock.getpeercert(binary_form=True)
     if not der_cert:
         logger.warning("No peer certificate from TLS socket.")
         return ""
-    fp = hashlib.sha256(der_cert).hexdigest().lower()
-    return fp
+    return hashlib.sha256(der_cert).hexdigest().lower()
 
 
 def verify_cert_fingerprint(tls_sock: ssl.SSLSocket, expected_fp: str) -> bool:
     """
     Compare the actual fingerprint to the expected one, ignoring case.
-    If expected_fp is empty or None, we skip the check (and return True).
+    If expected_fp is empty or None, this check is skipped (returns True).
     """
     if not expected_fp:
-        logger.debug("No expected fingerprint provided, skipping check => True")
+        logger.debug("No expected fingerprint provided => skipping fingerprint check => True")
         return True
 
     actual = get_server_cert_fingerprint(tls_sock)
     if not actual:
-        logger.warning("No certificate to verify, actual fingerprint is empty.")
+        logger.warning("No certificate to verify; actual fingerprint is empty => mismatch")
         return False
 
     match = (actual.lower() == expected_fp.lower())
@@ -117,12 +118,10 @@ def verify_cert_fingerprint(tls_sock: ssl.SSLSocket, expected_fp: str) -> bool:
 
 def check_session_resumption(tls_sock: ssl.SSLSocket) -> bool:
     """
-    Attempt to detect if the session is resumed. 
-    Python's `ssl.SSLSocket` doesn't always expose that, but we can do a 
-    best-effort check by comparing session ids or something. 
-    For demonstration, we show a placeholder approach:
+    Attempt to detect if the session is reused/resumed. Some Python versions
+    expose 'session_reused'; otherwise, this may be unavailable or always False.
     """
-    session_reused = getattr(tls_sock, "session_reused", False)  # python doesn't define this by default, depends on version
+    session_reused = getattr(tls_sock, "session_reused", False)
     logger.debug("check_session_resumption => session_reused=%s", session_reused)
     return bool(session_reused)
 
@@ -133,9 +132,11 @@ def log_tls_verification_event(
     event: str = "TLS_VERIFICATION"
 ) -> None:
     """
-    Writes an audit chain event with group name, fingerprint, config enforcement, etc.
-    A complementary approach to [34].
-    If you want to anchor 'session reuse' or other details, we can do that too.
+    Logs a TLS verification event to the audit chain, capturing:
+      - negotiated group
+      - certificate fingerprint
+      - enforcement and PQC mode
+      - session resumption info
     """
     group_name = _get_negotiated_group(tls_sock) or "unknown_group"
     fingerprint = get_server_cert_fingerprint(tls_sock)
