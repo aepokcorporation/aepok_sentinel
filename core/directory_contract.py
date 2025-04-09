@@ -21,11 +21,6 @@ Usage:
     # 2. Build absolute paths to specific subdirectories or files
     config_file_path = resolve_path("config", "trust_anchor.json")
 
-Audit References:
-    - Flaw [75]: Eliminate silent directory creation
-    - Flaw [76]: Use a single base path for all runtime logic
-    - Flaw [77]: Create a centralized directory contract with strict enforcement
-    - Flaw [78]: Raise hard failures if any directory/file is missing
 """
 
 import os
