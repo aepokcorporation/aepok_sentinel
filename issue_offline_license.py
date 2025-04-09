@@ -162,20 +162,10 @@ def main():
         print(f"Error signing the license: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Encode license object to base64 JSON (without embedded signature)
-    license_json = json.dumps(license_obj, separators=(",", ":"))
-    license_b64 = base64.b64encode(license_json.encode("utf-8")).decode("utf-8")
+    license_obj["signature"] = sig_dict
+    final_json = json.dumps(license_obj, separators=(",", ":"))
+    final_b64 = base64.b64encode(final_json.encode("utf-8")).decode("utf-8")
 
-    # Encode signature dict to base64 JSON
-    sig_json = json.dumps(sig_dict, separators=(",", ":"))
-    sig_b64 = base64.b64encode(sig_json.encode("utf-8")).decode("utf-8")
-
-    # Wrap in top-level package expected by license.py
-    final_package = {
-        "license": license_b64,
-        "signature": sig_b64
-    }
-    final_json = json.dumps(final_package, separators=(",", ":"))
     # Write .key file
     out_filename = f"{license_uuid}.key"
     out_path = os.path.join(args.out_dir, out_filename)
