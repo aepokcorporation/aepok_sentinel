@@ -1,6 +1,5 @@
+# status_printer.py
 """
-status_printer.py
-
 Provides two functions:
  - gather_system_status(config, license_mgr) -> str
    Returns a multiline string summarizing the current .sentinelrc config
@@ -9,11 +8,9 @@ Provides two functions:
  - print_system_status(config, license_mgr) -> None
    Prints the status to stdout and logs it at INFO.
 
-No directory creation or fallback logic here. 
-Fully final-shape compliance: no references to ephemeral placeholders or steps.
+No directory creation or fallback logic needed here.
 """
 
-import logging
 import sys
 from typing import Optional
 
@@ -31,7 +28,7 @@ def gather_system_status(config: SentinelConfig, license_mgr: LicenseManager) ->
       - encryption_enabled, strict_transport
       - license validity or watch-only
       - if mode=cloud => show cloud_keyvault_url
-      - other relevant config fields
+      - relevant config fields (allow_delete, poll interval, etc.)
     """
     lines = []
     lines.append("=== Aepok Sentinel System Status ===")
@@ -42,7 +39,7 @@ def gather_system_status(config: SentinelConfig, license_mgr: LicenseManager) ->
     lines.append("Encryption: ENABLED" if config.encryption_enabled else "Encryption: DISABLED")
     lines.append(f"strict_transport: {'TRUE' if config.strict_transport else 'FALSE'}")
 
-    # license state
+    # License state
     if is_license_valid(license_mgr):
         lines.append("License State: VALID")
     elif is_watch_only(license_mgr):
@@ -56,7 +53,6 @@ def gather_system_status(config: SentinelConfig, license_mgr: LicenseManager) ->
     # Additional details
     lines.append(f"allow_delete: {config.allow_delete}")
     lines.append(f"daemon_poll_interval: {config.daemon_poll_interval} (seconds)")
-    lines.append(f"Log path: {config.log_path}")
     lines.append(f"License required: {config.license_required}")
     lines.append(f"Hardware binding: {config.bound_to_hardware}")
 
