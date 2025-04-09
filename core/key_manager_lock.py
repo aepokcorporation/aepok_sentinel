@@ -1,7 +1,7 @@
 # aepok_sentinel/core/key_manager_lock.py
 
 """
-KeyRotationLock (Final Shape)
+KeyRotationLock
 
 Provides a cross-platform file lock used by KeyManager.rotate_keys() to ensure concurrency safety.
  - If must_fail_on_error = True => raise on lock error
