@@ -1,12 +1,14 @@
+# pqc_crypto.py
 """
-Aepok Sentinel - PQC Crypto Module (Final Shape)
+Aepok Sentinel - PQC Crypto Module
 
-Features:
-- AES-256 (GCM or CBC+HMAC) with PQC (Kyber) key wrapping, optional RSA fallback.
-- Dilithium + optional RSA signature with identity binding (signer_id, host_fingerprint, key_fingerprint).
-- Mandatory RNG validation before each operation (Flaw [56]).
-- Secure zeroization of ephemeral secrets (Flaws [9], [64]).
-- No automatic RSA fallback in STRICT/HARDENED (Flaw [10]).
+Provides:
+- AES-256 encryption (GCM or CBC+HMAC) with PQC (Kyber) key wrapping, and optional RSA fallback.
+- Dilithium plus optional RSA signature, including identity metadata.
+- Basic RNG validation before each operation.
+- Secure zeroization of ephemeral secrets.
+
+No automatic RSA fallback is allowed when in STRICT/HARDENED modes, per config settings.
 """
 
 import os
@@ -28,7 +30,6 @@ from cryptography.hazmat.primitives.asymmetric import (
 )
 from cryptography.hazmat.primitives import serialization
 
-# Local imports
 from aepok_sentinel.core.logging_setup import get_logger
 from aepok_sentinel.core.config import SentinelConfig
 
@@ -50,15 +51,14 @@ class CryptoSignatureError(Exception):
     pass
 
 
-# Module-level ephemeral buffers or cached keys, if any, can be stored here.
-# For final shape, we currently have none, but we illustrate the usage:
+# Module-level ephemeral storage, if needed.
 _ephemeral_storage = {}
 
 
 def sanitize_on_shutdown():
     """
-    Clears any module-level buffers or ephemeral data to reduce memory leftover (Flaw [64]).
-    Call this from the daemon/controller shutdown sequence.
+    Clears any module-level buffers or ephemeral data to reduce memory retention.
+    Call this at daemon/controller shutdown.
     """
     global _ephemeral_storage
     for k, v in list(_ephemeral_storage.items()):
@@ -73,7 +73,7 @@ def sanitize_on_shutdown():
 
 def secure_zero(data: bytearray) -> None:
     """
-    Overwrites the contents of a bytearray with zeros, mitigating memory retention.
+    Overwrites the contents of a bytearray with zeros to mitigate memory retention.
     """
     if data:
         for i in range(len(data)):
@@ -82,9 +82,8 @@ def secure_zero(data: bytearray) -> None:
 
 def validate_rng() -> None:
     """
-    Basic RNG health check. Reads random bytes twice, checks they differ.
-    Raises a warning if they match exactly, as that's extremely unlikely.
-    (Flaw [56] partial remediation.)
+    Basic RNG health check. Reads random bytes twice and verifies they differ.
+    Logs a warning if identical blocks are encountered.
     """
     block1 = os.urandom(32)
     block2 = os.urandom(32)
@@ -101,22 +100,23 @@ def encrypt_file_payload(
     rsa_pub: Optional[bytes] = None
 ) -> Dict[str, Any]:
     """
-    Encrypts plaintext into a JSON-based payload with PQC + optional RSA key wrapping.
-    Addresses Flaws [9], [10], [56].
-    
-    :param plaintext: raw bytes to encrypt
-    :param config: SentinelConfig (dictates CBC/GCM, fallback, enforcement_mode, etc.)
+    Encrypts plaintext into a JSON-based payload using Kyber for key wrapping
+    and optional RSA fallback if permitted. Then uses AES (GCM or CBC+HMAC)
+    to encrypt the data.
+
+    :param plaintext: Raw data to encrypt
+    :param config: SentinelConfig controlling encryption mode, fallback, etc.
     :param kyber_pub: Kyber public key bytes
     :param rsa_pub: RSA public key bytes, optional
     :raises CryptoDecryptionError: if encryption fails
-    :return: dict with fields per the global cryptographic payload format
+    :return: dict with encryption fields suitable for JSON serialization
     """
     if not oqs:
         raise ImportError("oqs library is required for PQC encryption but not found.")
 
     validate_rng()
 
-    # 1) Kyber encaps
+    # 1) Kyber encaps to obtain shared_secret => AES key
     aes_key = b""
     wrapped_kyber = b""
     shared_secret = b""
@@ -125,13 +125,11 @@ def encrypt_file_payload(
             wrapped_kyber, shared_secret = kem.encap_secret(kyber_pub)
         aes_key = hashlib.sha256(shared_secret).digest()
     except Exception as e:
-        msg = f"Kyber encryption failed: {e}"
-        logger.error(msg)
-        raise CryptoDecryptionError(msg)
+        logger.error("Kyber encryption failed: %s", e)
+        raise CryptoDecryptionError(f"Kyber encryption failed: {e}")
     finally:
         if shared_secret:
-            ba_ss = bytearray(shared_secret)
-            secure_zero(ba_ss)
+            secure_zero(bytearray(shared_secret))
 
     # 2) Optional RSA fallback if not in strict/hardened
     wrapped_rsa = b""
@@ -152,9 +150,8 @@ def encrypt_file_payload(
                 )
             )
         except Exception as e:
-            msg = f"RSA fallback encryption failed: {e}"
-            logger.error(msg)
-            raise CryptoDecryptionError(msg)
+            logger.error("RSA fallback encryption failed: %s", e)
+            raise CryptoDecryptionError(f"RSA fallback encryption failed: {e}")
 
     # 3) AES encryption (GCM or CBC+HMAC)
     iv = os.urandom(12) if not config.use_cbc_hmac else os.urandom(16)
@@ -163,12 +160,13 @@ def encrypt_file_payload(
     integrity_hex = ""
     try:
         if not config.use_cbc_hmac:
+            # GCM
             cipher = Cipher(algorithms.AES(aes_key), modes.GCM(iv), backend=default_backend())
             encryptor = cipher.encryptor()
             ciphertext = encryptor.update(plaintext) + encryptor.finalize()
             auth_tag = encryptor.tag
         else:
-            # CBC
+            # CBC + HMAC
             cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
             encryptor = cipher.encryptor()
             padder = padding.PKCS7(128).padder()
@@ -179,13 +177,11 @@ def encrypt_file_payload(
             h.update(ciphertext)
             integrity_hex = h.finalize().hex()
     except Exception as e:
-        msg = f"AES encryption failed: {e}"
-        logger.error(msg)
-        raise CryptoDecryptionError(msg)
+        logger.error("AES encryption failed: %s", e)
+        raise CryptoDecryptionError(f"AES encryption failed: {e}")
     finally:
         if aes_key:
-            ba_key = bytearray(aes_key)
-            secure_zero(ba_key)
+            secure_zero(bytearray(aes_key))
 
     payload = {
         "version": 1,
@@ -207,11 +203,11 @@ def decrypt_file_payload(
     rsa_priv: Optional[bytes] = None
 ) -> bytes:
     """
-    Decrypts the given payload. Tries Kyber first. If that fails and fallback is allowed,
-    tries RSA, except in STRICT/HARDENED. (Flaw [10])
+    Decrypts the given payload. Attempts Kyber decapsulation first. If that fails
+    and fallback is permitted, tries RSA. Then uses AES (GCM or CBC+HMAC) to recover plaintext.
 
-    Zeroizes ephemeral keys. 
-    Raises CryptoDecryptionError on any failure.
+    :raises CryptoDecryptionError: on any failure
+    :return: Decrypted plaintext bytes
     """
     if not oqs:
         raise ImportError("oqs library is required for PQC decryption but not found.")
@@ -223,42 +219,41 @@ def decrypt_file_payload(
         b64_kyber = payload["wrapped_key_kyber"]
         b64_iv = payload["iv"]
     except KeyError as e:
-        msg = f"Payload missing required field: {e}"
-        logger.error(msg)
-        raise CryptoDecryptionError(msg)
+        logger.error("Payload missing required field: %s", e)
+        raise CryptoDecryptionError(f"Payload missing required field: {e}")
 
     ciphertext = base64.b64decode(b64_ct)
     wrapped_kyber = base64.b64decode(b64_kyber)
     iv = base64.b64decode(b64_iv)
 
     wrapped_rsa = base64.b64decode(payload.get("wrapped_key_rsa", "")) if payload.get("wrapped_key_rsa") else b""
-    
+    auth_tag = None
     try:
-        auth_tag = base64.b64decode(payload["auth_tag"]) if payload.get("auth_tag") else None
+        if payload.get("auth_tag"):
+            auth_tag = base64.b64decode(payload["auth_tag"])
     except Exception as e:
-        logger.warning("auth_tag decode failed: %s", e)
+        logger.warning("GCM tag parse error: %s", e)
         raise CryptoDecryptionError(f"GCM tag parse error: {e}")
-    
+
     integrity_hex = payload.get("integrity", "")
 
     aes_key = b""
     shared_secret = b""
     kyber_failed = False
 
-    # 1) Attempt Kyber decapsulation
+    # 1) Kyber decapsulation
     try:
         with oqs.KeyEncapsulation("Kyber512", kyber_priv) as kem:
             shared_secret = kem.decap_secret(wrapped_kyber)
         aes_key = hashlib.sha256(shared_secret).digest()
     except Exception as e:
-        logger.warning("Kyber decap failed => %s", e)
+        logger.warning("Kyber decapsulation failed: %s", e)
         kyber_failed = True
     finally:
         if shared_secret:
-            ba_ss = bytearray(shared_secret)
-            secure_zero(ba_ss)
+            secure_zero(bytearray(shared_secret))
 
-    # 2) If Kyber failed, attempt RSA fallback only if allowed
+    # 2) RSA fallback if allowed
     fallback_allowed = (
         kyber_failed and
         config.allow_classical_fallback and
@@ -278,8 +273,7 @@ def decrypt_file_payload(
                     label=None
                 )
             )
-
-            # NEW: Log RSA fallback usage to audit chain
+            # Emit SIGNATURE_RSA_USED as a fallback marker
             try:
                 from aepok_sentinel.core.audit_chain import append_event
                 append_event("SIGNATURE_RSA_USED", {
@@ -290,36 +284,32 @@ def decrypt_file_payload(
                 })
             except Exception:
                 logger.warning("Failed to emit SIGNATURE_RSA_USED audit event.")
-
         except Exception as e:
-            msg = f"RSA fallback also failed => {e}"
-            logger.error(msg)
-            raise CryptoDecryptionError(msg)
+            logger.error("RSA fallback also failed => %s", e)
+            raise CryptoDecryptionError(f"RSA fallback also failed => {e}")
     elif kyber_failed and not fallback_allowed:
-        msg = "Kyber decap failed. Fallback not allowed (STRICT/HARDENED or config)."
-        logger.error(msg)
-        raise CryptoDecryptionError(msg)
+        logger.error("Kyber failed. Fallback not allowed by config or mode.")
+        raise CryptoDecryptionError("Kyber decap failed with no fallback allowed.")
 
-    # 3) Decrypt with AES (GCM or CBC+HMAC)
+    # 3) AES decrypt (GCM or CBC+HMAC)
     plaintext = b""
     try:
         if not config.use_cbc_hmac:
             if not auth_tag:
-                raise CryptoDecryptionError("GCM mode but no auth_tag in payload.")
+                raise CryptoDecryptionError("GCM mode requires 'auth_tag'.")
             cipher = Cipher(algorithms.AES(aes_key), modes.GCM(iv, auth_tag), backend=default_backend())
             decryptor = cipher.decryptor()
             plaintext = decryptor.update(ciphertext) + decryptor.finalize()
         else:
-            # CBC + HMAC
             if not integrity_hex:
-                raise CryptoDecryptionError("CBC+HMAC mode but no 'integrity' field in payload.")
-            
+                raise CryptoDecryptionError("CBC+HMAC mode requires 'integrity' field.")
+            # Validate HMAC
             try:
                 expected_hmac = bytes.fromhex(integrity_hex)
             except Exception as e:
-                logger.warning("HMAC integrity hex malformed: %s", e)
-                raise CryptoDecryptionError(f"Malformed integrity hex in payload: {e}")
-    
+                logger.warning("Malformed integrity hex: %s", e)
+                raise CryptoDecryptionError(f"Malformed integrity hex: {e}")
+
             h = hmac.HMAC(aes_key, hashes.SHA512(), backend=default_backend())
             h.update(ciphertext)
             h.verify(expected_hmac)
@@ -330,13 +320,11 @@ def decrypt_file_payload(
             unpad = padding.PKCS7(128).unpadder()
             plaintext = unpad.update(padded_pt) + unpad.finalize()
     except Exception as e:
-        msg = f"Decryption/integrity check failed => {e}"
-        logger.error(msg)
-        raise CryptoDecryptionError(msg)
+        logger.error("Decryption or integrity check failed => %s", e)
+        raise CryptoDecryptionError(f"Decryption or integrity check failed => {e}")
     finally:
         if aes_key:
-            ba_key = bytearray(aes_key)
-            secure_zero(ba_key)
+            secure_zero(bytearray(aes_key))
 
     return plaintext
 
@@ -348,10 +336,8 @@ def sign_content_bundle(
     rsa_priv: Optional[bytes] = None
 ) -> Dict[str, Any]:
     """
-    Signs data with Dilithium, optionally RSA if fallback is allowed. 
-    Binds identity info (signer_id, host_fingerprint, key_fingerprint) to each signature (Flaw [11]).
-
-    Returns:
+    Signs data with Dilithium, optionally RSA if fallback is allowed, embedding minimal identity metadata.
+    Returns a dict structured as:
     {
       "dilithium": "<base64>",
       "rsa": "<base64 or empty>",
@@ -367,7 +353,7 @@ def sign_content_bundle(
 
     validate_rng()
 
-    # 1) Dilithium sign
+    # Dilithium sign
     dil_sig_bytes = b""
     dil_sign_b64 = ""
     try:
@@ -379,10 +365,9 @@ def sign_content_bundle(
         raise CryptoSignatureError(e)
     finally:
         if dil_sig_bytes:
-            ba_sig = bytearray(dil_sig_bytes)
-            secure_zero(ba_sig)
+            secure_zero(bytearray(dil_sig_bytes))
 
-    # 2) RSA sign if fallback allowed and not STRICT/HARDENED
+    # RSA sign fallback if allowed
     rsa_sign_b64 = ""
     fallback_allowed = (
         config.allow_classical_fallback and
@@ -402,11 +387,9 @@ def sign_content_bundle(
             logger.error("RSA sign fallback failed: %s", e)
             raise CryptoSignatureError(e)
 
-    # 3) Identity binding
-    # We'll attempt to read them from config.raw_dict or fallback to placeholders
+    # Identity binding
     signer_id = config.raw_dict.get("signer_id", "unknown_signer")
     host_fp = config.raw_dict.get("host_fingerprint", "unknown_host")
-    # For demonstration, compute a short SHA256 of the Dil priv. In real usage we'd use the pub key's fingerprint.
     key_fp = hashlib.sha256(dil_priv).hexdigest()[:16] + "..."
 
     return {
@@ -428,21 +411,19 @@ def verify_content_signature(
     rsa_pub: Optional[bytes] = None
 ) -> bool:
     """
-    Verifies PQC signature (Dilithium) and optionally RSA if fallback is allowed.
-    Both must succeed if RSA is present. If either fails => returns False.
+    Verifies a Dilithium signature and, if present and allowed, RSA fallback. Both must pass if RSA is included.
 
-    Flaw [11] fix: We now see identity metadata in 'signatures["metadata"]',
-    but we do not enforce it here. That check belongs to a higher-level policy if needed.
+    :return: True if verification succeeds, otherwise False
     """
     if not oqs:
         raise ImportError("oqs library required for PQC verify but not found.")
 
     dil_sig_b64 = signatures.get("dilithium", "")
     if not dil_sig_b64:
-        logger.error("Missing Dilithium signature in signature dict.")
+        logger.error("Missing Dilithium signature field.")
         return False
 
-    # 1) Dilithium verify
+    # Dilithium verify
     try:
         with oqs.Signature("Dilithium2", dil_pub) as sig:
             dil_sig = base64.b64decode(dil_sig_b64)
@@ -451,40 +432,46 @@ def verify_content_signature(
         logger.warning("Dilithium signature verification failed: %s", e)
         return False
 
-        # 2) RSA fallback check
-        rsa_sig_b64 = signatures.get("rsa", "")
-        fallback_allowed = (
-            config.allow_classical_fallback and
-            rsa_pub is not None and
-            rsa_sig_b64 and
-            not (config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"))
-        )
-        if fallback_allowed:
+    # RSA fallback if included and allowed
+    rsa_sig_b64 = signatures.get("rsa", "")
+    fallback_allowed = (
+        config.allow_classical_fallback and
+        rsa_pub is not None and
+        rsa_sig_b64 and
+        not (config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"))
+    )
+    if fallback_allowed:
+        try:
+            rsa_sig = base64.b64decode(rsa_sig_b64)
+            pub_key = _load_rsa_public_key(rsa_pub)
+            pub_key.verify(
+                rsa_sig,
+                data,
+                asym_padding.PKCS1v15(),
+                hashes.SHA256()
+            )
+            # Log fallback signature usage
             try:
-                rsa_sig = base64.b64decode(rsa_sig_b64)
-                pub_key = _load_rsa_public_key(rsa_pub)
-                pub_key.verify(
-                    rsa_sig,
-                    data,
-                    asym_padding.PKCS1v15(),
-                    hashes.SHA256()
-                )
-                # Log fallback signature usage
                 from aepok_sentinel.core import audit_chain
                 audit_chain.append_event("SIGNATURE_RSA_USED", {
                     "context": "verify_content_signature",
                     "enforcement_mode": config.enforcement_mode,
                     "host_fingerprint": config.raw_dict.get("host_fingerprint", "unknown")
                 })
-            except Exception as e:
-                logger.warning("RSA signature verification failed: %s", e)
-                return False
+            except Exception:
+                logger.warning("Failed to emit SIGNATURE_RSA_USED event in verify_content_signature.")
+        except Exception as e:
+            logger.warning("RSA signature verification failed: %s", e)
+            return False
 
     return True
 
 
 def _load_rsa_public_key(key_data: bytes):
-    """Helper to load RSA pub key from PEM or DER."""
+    """
+    Loads an RSA public key from PEM or DER data.
+    Raises CryptoDecryptionError if load fails.
+    """
     try:
         if b"-----BEGIN" in key_data:
             return serialization.load_pem_public_key(key_data, backend=default_backend())
@@ -495,7 +482,10 @@ def _load_rsa_public_key(key_data: bytes):
 
 
 def _load_rsa_private_key(key_data: bytes):
-    """Helper to load RSA priv key from PEM or DER."""
+    """
+    Loads an RSA private key from PEM or DER data.
+    Raises CryptoDecryptionError if load fails.
+    """
     try:
         if b"-----BEGIN" in key_data:
             return serialization.load_pem_private_key(key_data, password=None, backend=default_backend())
