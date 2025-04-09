@@ -341,6 +341,29 @@ class SentinelController:
         anchor_sig = resolve_path("config", "trust_anchor.json.sig")
         self._verify_file_signature(anchor_path, anchor_sig, desc="trust_anchor.json")
 
+        expected_id_hash = anchor_obj.get("identity_json_sha256")
+        if expected_id_hash:
+            import hashlib
+            try:
+                data = identity_path.read_bytes()
+                actual_hash = hashlib.sha256(data).hexdigest()
+                if actual_hash != expected_id_hash.lower():
+                    msg = (
+                        f"identity.json hash mismatch => expected={expected_id_hash}, got={actual_hash}"
+                    )
+                    logger.error(msg)
+                    if self._must_fail():
+                        raise ControllerError(msg)
+                    else:
+                        logger.warning("identity.json hash mismatch => continuing in permissive mode.")
+            except Exception as e:
+                msg = f"Failed to compute identity.json hash => {e}"
+                logger.error(msg)
+                if self._must_fail():
+                    raise ControllerError(msg)
+        else:
+            logger.warning("No identity_json_sha256 in trust_anchor => skipping hash bind.")
+
         # parse trust_anchor to check vendor_dil pub hash
         try:
             with open(anchor_path, "r", encoding="utf-8") as f:
