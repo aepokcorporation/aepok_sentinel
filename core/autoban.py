@@ -1,14 +1,16 @@
+# autoban.py
 """
-autoban.py
+Autoban Source Enforcement
 
-Final-shape Autoban Source Enforcement:
- - On suspicious or malicious events from a given source, we can block that source at the firewall level.
- - We verify the firewall binaries' paths + hashes before running them (flaw #30).
- - We store a signed JSON blocklist on disk (flaw #31), verifying upon load so it cannot be tampered with silently.
- - We support a block TTL (autoban_block_ttl_days) so that blocks expire after some days (flaw #32).
- - We never create directories automatically; if the directory for blocklist_file is missing, we fail.
+This module implements an automated process to block sources identified as malicious
+or suspicious, using platform-specific firewall commands. It stores the blocklist in
+a JSON file accompanied by a signature, ensuring tamper-evident persistence. Key features:
 
-No references to ephemeral placeholders or partial "step" logic.
+ - If autoban is disabled or in watch-only mode, real blocking is skipped.
+ - The blocklist must be located in an existing directory; no silent creation occurs.
+ - Each source block can expire after a TTL (autoban_block_ttl_days).
+ - Firewall commands are only invoked if the binary's SHA-256 hash is trusted.
+ - Enforcement actions log relevant events to the audit chain (SOURCE_BLOCKED, AUTOBAN_TRIGGERED).
 """
 
 import os
@@ -20,31 +22,35 @@ import time
 import datetime
 from typing import Dict, Set, Optional
 
+from shutil import which
+from hashlib import sha256
+
 from aepok_sentinel.core.logging_setup import get_logger
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, is_watch_only
 from aepok_sentinel.core.audit_chain import AuditChain
 from aepok_sentinel.core.constants import EventCode
-from aepok_sentinel.core.pqc_crypto import sign_content_bundle, verify_content_signature, CryptoSignatureError
-from aepok_sentinel.core.pqc_crypto import CryptoDecryptionError
-from shutil import which
-from hashlib import sha256
+from aepok_sentinel.core.pqc_crypto import (
+    sign_content_bundle,
+    verify_content_signature,
+    CryptoSignatureError,
+    CryptoDecryptionError
+)
 
 logger = get_logger("autoban")
 
 
 class AutobanError(Exception):
-    """Raised if firewall blocking fails or config disallows autoban."""
+    """Raised if firewall blocking fails, or config disallows autoban operations."""
 
 
 class AutobanManager:
     """
     Manages source autoban logic:
-      - Maintains a set of blocked sources in memory
-      - Persists them in a JSON + signature to disk
-      - Enforces real firewall rules after verifying the firewall binary's trust
-      - Honors watch-only => no real block
-      - Expires blocks after config["autoban_block_ttl_days"] days
+     - Maintains a blocklist in memory and on disk (signed JSON).
+     - Executes firewall commands if not in watch-only mode.
+     - Honors block TTL, automatically unblocking when expired.
+     - Verifies firewall binaries are trusted (by SHA-256 hash) before running them.
     """
 
     def __init__(
@@ -61,31 +67,31 @@ class AutobanManager:
         self.blocklist_file = blocklist_file
         self.sign_priv_key_path = sign_priv_key_path
 
-        # check directory
+        # Ensure directory for the blocklist file exists (external location, not within sentinel runtime)
         dir_path = os.path.dirname(blocklist_file)
         if not os.path.isdir(dir_path):
             raise RuntimeError(f"Directory for blocklist_file does not exist: {dir_path}")
 
         self.autoban_enabled = bool(self.config.raw_dict.get("autoban_enabled", False))
         self.ttl_days = int(self.config.raw_dict.get("autoban_block_ttl_days", 0))  # 0 => no expiration
-        self.trusted_hashes = self.config.raw_dict.get("trusted_firewall_hashes", [])
 
-        # Inject fallback hashes for known-good binaries (only if none provided)
+        # Trusted firewall hashes from config
+        self.trusted_hashes = self.config.raw_dict.get("trusted_firewall_hashes", [])
         if not self.trusted_hashes:
             self.trusted_hashes = self._get_fallback_trusted_hashes()
 
-        # If still empty => fail if autoban is enabled
+        # If autoban is enabled but we have no trusted hashes, fail
         if self.autoban_enabled and not self.trusted_hashes:
-            raise RuntimeError("Autoban is enabled, but no trusted_firewall_hashes are defined or found.")
+            raise RuntimeError("Autoban is enabled, but no trusted_firewall_hashes provided or found.")
 
-        # load blocklist + signature
+        # Load blocklist (signed)
         self.blocked_data: Dict[str, Dict[str, str]] = {}
         self._load_blocklist()
-        
+
     def _get_fallback_trusted_hashes(self) -> list:
         """
-        Provide known-good trusted hashes for core firewall binaries if none are declared in config.
-        These should be updated to match real production hashes per deployment.
+        Provide known-good fallback SHA-256 hashes for typical firewall binaries
+        if none are supplied in the config. This is only an example approach.
         """
         import hashlib
         fallback = []
@@ -107,27 +113,27 @@ class AutobanManager:
 
     def record_bad_source(self, identifier: str, reason: str) -> None:
         """
-        Called upon suspicious event from a source.
-        - If not autoban_enabled => do nothing (just info).
-        - If watch_only => log to chain as SOURCE_BLOCKED but skip firewall changes.
-        - If not blocked => firewall block => chain event => "AUTOBAN_TRIGGERED".
+        Called when we detect a suspicious source. 
+         - If autoban_enabled=False => skip.
+         - If watch_only => log SOURCE_BLOCKED but no actual firewall action.
+         - If already blocked => skip duplicate.
+         - Otherwise => enforce firewall block, log to audit chain, and save the blocklist.
         """
         if not self.autoban_enabled:
             logger.info("Autoban disabled => skip blocking source=%s reason=%s", identifier, reason)
             return
 
-        self._purge_expired()  # ensure we purge old blocks if any
+        self._purge_expired()
 
         if identifier in self.blocked_data:
-            logger.debug("Source %s already blocked, skipping repeat block. reason=%s", identifier, reason)
+            logger.debug("Source %s already blocked, skipping. reason=%s", identifier, reason)
             return
 
-        # watch-only => no real block
         if is_watch_only(self.license_mgr):
             self._append_chain_event(EventCode.SOURCE_BLOCKED, {"source": identifier, "reason": reason, "action": "watch-only"})
             return
 
-        # normal path => enforce block
+        # normal blocking
         try:
             self.enforce_block(identifier)
             self.blocked_data[identifier] = {"blocked_on": str(int(time.time()))}
@@ -142,31 +148,25 @@ class AutobanManager:
 
     def is_blocked(self, identifier: str) -> bool:
         """
-        Checks if source is in blocklist. If TTL is set and source is expired => unblock + remove it.
+        Checks if 'identifier' is in the in-memory blocklist. Also purges expired blocks first.
         """
         self._purge_expired()
         return identifier in self.blocked_data
 
     def enforce_block(self, identifier: str) -> None:
         """
-        Issues a firewall command after verifying the binary is trusted.
-        Platform logic:
-         - Linux => try 'ufw' or 'iptables'
-         - Windows => 'netsh advfirewall'
-         - macOS => 'ipfw' or possibly 'pfctl'
-        If none found or verification fails => raise.
+        Runs a platform-specific firewall command to block 'identifier' after verifying the binary's trust.
+        Raises AutobanError if no trusted firewall binary is found or the command fails.
         """
-        platform = sys.platform
-
-        # pick candidate commands in order
-        if platform.startswith("linux"):
+        platform_str = sys.platform
+        if platform_str.startswith("linux"):
             candidates = ["ufw", "iptables"]
-        elif platform.startswith("win"):
+        elif platform_str.startswith("win"):
             candidates = ["netsh"]
-        elif platform.startswith("darwin"):
+        elif platform_str.startswith("darwin"):
             candidates = ["ipfw", "pfctl"]
         else:
-            raise AutobanError(f"Unsupported platform '{platform}' for firewall block.")
+            raise AutobanError(f"Unsupported platform '{platform_str}' for firewall blocking.")
 
         cmd_path = None
         for c in candidates:
@@ -176,9 +176,9 @@ class AutobanManager:
                 break
 
         if not cmd_path:
-            raise AutobanError(f"No trusted firewall binary found among {candidates} on platform={platform}")
+            raise AutobanError(f"No trusted firewall binary found among {candidates} on '{platform_str}'")
 
-        cmd_args = self._build_firewall_command_args(platform, cmd_path, identifier)
+        cmd_args = self._build_firewall_command_args(platform_str, cmd_path, identifier)
         logger.info("Executing firewall block command: %s", " ".join(cmd_args))
         try:
             completed = subprocess.run(cmd_args, capture_output=True, text=True, check=False)
@@ -187,16 +187,72 @@ class AutobanManager:
         except Exception as e:
             raise AutobanError(f"Failed to run firewall command: {e}")
 
-    # -----------------------------------------------
-    # Private blocklist (with signature)
-    # -----------------------------------------------
+    def enforce_unblock(self, identifier: str) -> None:
+        """
+        Removes the firewall rule for 'identifier'. In production, you'd store the exact rule ID or name.
+        We do best-effort here. If removal fails, logs a warning but continues.
+        """
+        platform_str = sys.platform
+        if platform_str.startswith("linux"):
+            ufw_path = which("ufw")
+            ipt_path = which("iptables")
+            if ufw_path and self._verify_binary_trusted(ufw_path):
+                cmd = [ufw_path, "delete", "deny", "from", identifier]
+            elif ipt_path and self._verify_binary_trusted(ipt_path):
+                cmd = [ipt_path, "-D", "INPUT", "-s", identifier, "-j", "DROP"]
+            else:
+                raise AutobanError("No valid/trusted firewall binary for unblocking on Linux.")
+        elif platform_str.startswith("win"):
+            cmd = ["netsh", "advfirewall", "firewall", "delete", "rule", f'name=SentinelBlock {identifier}']
+        elif platform_str.startswith("darwin"):
+            ipfw_path = which("ipfw")
+            if ipfw_path and self._verify_binary_trusted(ipfw_path):
+                cmd = [ipfw_path, "delete", "deny", "ip", "from", identifier, "to", "any"]
+            else:
+                raise AutobanError("No valid/trusted firewall binary for unblocking on macOS.")
+        else:
+            raise AutobanError(f"Unsupported platform '{platform_str}' for unblocking source.")
+
+        logger.info("Executing firewall unblock command: %s", " ".join(cmd))
+        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if completed.returncode != 0:
+            logger.warning("Unblock command failed (rc=%d): %s", completed.returncode, completed.stderr.strip())
+
+    # ------------------------
+    # Expiration logic
+    # ------------------------
+    def _purge_expired(self) -> None:
+        if self.ttl_days <= 0:
+            return
+        now_ts = int(time.time())
+        expired = []
+        for identifier, meta in self.blocked_data.items():
+            blocked_on = int(meta.get("blocked_on", "0"))
+            if blocked_on <= 0:
+                continue
+            if (now_ts - blocked_on) > (self.ttl_days * 86400):
+                expired.append(identifier)
+        if not expired:
+            return
+        logger.info("Purging %d expired source blocks (TTL=%d days).", len(expired), self.ttl_days)
+        for identifier in expired:
+            try:
+                self.enforce_unblock(identifier)
+            except Exception as e:
+                logger.warning("Failed to unblock source %s during purge: %s", identifier, e)
+            self.blocked_data.pop(identifier, None)
+        self._save_blocklist()
+
+    # ------------------------
+    # Signed blocklist I/O
+    # ------------------------
     def _load_blocklist(self) -> None:
         if not os.path.isfile(self.blocklist_file):
-            return  # no blocklist => empty
+            return
 
         sig_file = self.blocklist_file + ".sig"
         if not os.path.isfile(sig_file):
-            logger.warning("Blocklist signature file missing => ignoring blocklist for safety.")
+            logger.warning("Blocklist signature file missing => ignoring stored blocklist.")
             return
 
         try:
@@ -210,21 +266,17 @@ class AutobanManager:
 
         try:
             with open(self.sign_priv_key_path, "rb") as kf:
-                dil_priv = kf.read()
+                dil_priv = kf.read()  # This usage is questionable—verifying with priv key?
         except Exception as e:
-            logger.warning("Missing or unreadable Dilithium key for blocklist verification: %s", e)
+            logger.warning("Missing/unreadable Dilithium key for blocklist verify: %s", e)
             return
 
-        import base64
-        import json as j
+        import base64, json
         try:
-            sig_json_bytes = base64.b64decode(sig_bytes)
-            sig_dict = j.loads(sig_json_bytes.decode("utf-8"))
+            sig_dict = json.loads(base64.b64decode(sig_bytes).decode("utf-8"))
         except Exception as e:
             logger.warning("Blocklist signature is corrupted: %s", e)
             return
-
-        from aepok_sentinel.core.pqc_crypto import verify_content_signature
 
         if not verify_content_signature(content.encode("utf-8"), sig_dict, self.config, dil_priv, None):
             logger.warning("Blocklist signature invalid => ignoring blocklist.")
@@ -233,7 +285,7 @@ class AutobanManager:
         try:
             data = json.loads(content)
             if not isinstance(data, dict):
-                raise ValueError("blocklist content must be a dict { source: { ... } }")
+                raise ValueError("Blocklist content must be a dict {source: {...}}")
             self.blocked_data = data
             logger.info("Loaded %d blocked source entries from disk (signed).", len(self.blocked_data))
         except Exception as e:
@@ -241,10 +293,6 @@ class AutobanManager:
 
     def _save_blocklist(self) -> None:
         try:
-            dir_path = os.path.dirname(self.blocklist_file)
-            if not os.path.isdir(dir_path):
-                raise RuntimeError(f"Blocklist directory missing: {dir_path}")
-
             content_str = json.dumps(self.blocked_data, indent=2)
             with open(self.blocklist_file, "w", encoding="utf-8") as f:
                 f.write(content_str)
@@ -252,123 +300,52 @@ class AutobanManager:
             with open(self.sign_priv_key_path, "rb") as kf:
                 dil_priv = kf.read()
 
-            from aepok_sentinel.core.pqc_crypto import sign_content_bundle
             sig_bundle = sign_content_bundle(content_str.encode("utf-8"), self.config, dil_priv, None)
-            import base64
-            import json as j
-            sig_json_bytes = json.dumps(sig_bundle).encode("utf-8")
-            sig_b64 = base64.b64encode(sig_json_bytes)
+            import base64, json as j
+            sig_b64 = base64.b64encode(j.dumps(sig_bundle).encode("utf-8"))
 
             with open(self.blocklist_file + ".sig", "wb") as sf:
                 sf.write(sig_b64)
         except Exception as e:
             logger.warning("Failed to save blocklist or signature: %s", e)
 
-    # -----------------------------------------------
-    # Expiry logic
-    # -----------------------------------------------
-    def _purge_expired(self) -> None:
-        """
-        If self.ttl_days > 0 => remove any source blocked older than that TTL.
-        Also enforce_unblock(...) if so desired. For final shape, let's do it.
-        """
-        if self.ttl_days <= 0:
-            return
-
-        now_ts = int(time.time())
-        expired_sources = []
-        for identifier, meta in self.blocked_data.items():
-            blocked_on = int(meta.get("blocked_on", "0"))
-            if blocked_on <= 0:
-                continue
-            dt = now_ts - blocked_on
-            if dt > (self.ttl_days * 86400):
-                expired_sources.append(identifier)
-
-        if not expired_sources:
-            return
-
-        logger.info("Purging %d expired source blocks (TTL=%d days).", len(expired_sources), self.ttl_days)
-        for identifier in expired_sources:
-            try:
-                self.enforce_unblock(identifier)
-            except Exception as e:
-                logger.warning("Failed to unblock source %s during purge: %s", identifier, e)
-            self.blocked_data.pop(identifier, None)
-
-        self._save_blocklist()
-
-    def enforce_unblock(self, identifier: str) -> None:
-        """
-        Removes the firewall rule blocking 'identifier'. For demonstration,
-        we try to reverse the commands from enforce_block.
-        This might be non-trivial on each platform. We do a best effort.
-        If we can't remove => we log a warning or error.
-        """
-        platform = sys.platform
-        if platform.startswith("linux"):
-            ufw_path = which("ufw")
-            ipt_path = which("iptables")
-            if ufw_path and self._verify_binary_trusted(ufw_path):
-                cmd = [ufw_path, "delete", "deny", "from", identifier]
-            elif ipt_path and self._verify_binary_trusted(ipt_path):
-                cmd = [ipt_path, "-D", "INPUT", "-s", identifier, "-j", "DROP"]
-            else:
-                raise AutobanError("No valid or trusted firewall binary for unblocking on Linux.")
-        elif platform.startswith("win"):
-            cmd = ["netsh", "advfirewall", "firewall", "delete", "rule", f'name=SentinelBlock {identifier}']
-        elif platform.startswith("darwin"):
-            ipfw_path = which("ipfw")
-            if ipfw_path and self._verify_binary_trusted(ipfw_path):
-                cmd = [ipfw_path, "delete", "deny", "ip", "from", identifier, "to", "any"]
-            else:
-                raise AutobanError("No valid/trusted binary on macOS for unblocking.")
-        else:
-            raise AutobanError(f"Unsupported platform '{platform}' for unblocking source.")
-
-        logger.info("Executing firewall unblock command: %s", " ".join(cmd))
-        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if completed.returncode != 0:
-            logger.warning("Unblock command failed (rc=%d): %s", completed.returncode, completed.stderr.strip())
-
-    # -----------------------------------------------
+    # ------------------------
     # Helpers
-    # -----------------------------------------------
-    def _build_firewall_command_args(self, platform: str, cmd_path: str, identifier: str) -> list:
-        """
-        Based on platform + cmd_path, construct the final command list for blocking 'identifier'.
-        """
-        if platform.startswith("linux"):
+    # ------------------------
+    def _append_chain_event(self, event_code: EventCode, metadata: dict) -> None:
+        try:
+            self.audit_chain.append_event(event_code.value, metadata)
+        except Exception as e:
+            logger.error("Failed to append chain event for %s: %s", event_code.value, e)
+
+    def _build_firewall_command_args(self, platform_str: str, cmd_path: str, identifier: str) -> list:
+        if platform_str.startswith("linux"):
             if os.path.basename(cmd_path) == "ufw":
                 return [cmd_path, "deny", "from", identifier]
             else:
                 return [cmd_path, "-I", "INPUT", "-s", identifier, "-j", "DROP"]
-        elif platform.startswith("win"):
+        elif platform_str.startswith("win"):
             return [
                 cmd_path, "advfirewall", "firewall", "add", "rule",
                 f"name=SentinelBlock {identifier}",
                 "dir=in", "interface=any", "action=block", f"remoteip={identifier}"
             ]
-        elif platform.startswith("darwin"):
+        elif platform_str.startswith("darwin"):
             if os.path.basename(cmd_path) == "ipfw":
                 return [cmd_path, "add", "deny", "ip", "from", identifier, "to", "any"]
             else:
                 return [cmd_path, "-f", f"block drop from {identifier} to any"]
         else:
-            raise AutobanError(f"Unsupported platform '{platform}'")
+            raise AutobanError(f"Unsupported platform '{platform_str}'")
 
     def _verify_binary_trusted(self, bin_path: str) -> bool:
         """
-        Checks if bin_path's sha256 matches a known list of trusted firewall binaries,
-        so we don't run a tampered one.
-        For demonstration, we store these in a local dictionary. If empty => raise AutobanError.
+        Checks if bin_path's sha256 is in our known set of trusted firewall hashes.
+        Raises AutobanError if no such list is defined or mismatch occurs.
         """
-        trusted_binaries = {
-            # e.g. "/usr/sbin/ufw": "abc123sha256..."
-        }
-
-        if not trusted_binaries:
-            raise AutobanError("No trusted firewall binaries defined. Enforcement is not secure.")
+        # For demonstration, a minimal approach:
+        if not self.trusted_hashes:
+            raise AutobanError("No trusted firewall binary hashes defined; cannot verify firewall binary.")
 
         try:
             with open(bin_path, "rb") as bf:
@@ -378,19 +355,8 @@ class AutobanManager:
             logger.warning("Failed to read firewall binary %s for trust check: %s", bin_path, e)
             return False
 
-        expected_hash = trusted_binaries.get(bin_path)
-        if not expected_hash:
-            logger.warning("Binary %s not in trusted list => refusing to run it.", bin_path)
-            return False
-
-        if hash_val.lower() != expected_hash.lower():
-            logger.warning("Binary %s hash mismatch: got=%s, expected=%s", bin_path, hash_val, expected_hash)
+        if hash_val.lower() not in [h.lower() for h in self.trusted_hashes]:
+            logger.warning("Binary %s hash not in trusted list => refusing to run it.", bin_path)
             return False
 
         return True
-
-    def _append_chain_event(self, event_code: EventCode, metadata: dict) -> None:
-        try:
-            self.audit_chain.append_event(event_code.value, metadata)
-        except Exception as e:
-            logger.error("Failed to append chain event for %s: %s", event_code.value, e)
