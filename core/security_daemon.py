@@ -399,7 +399,7 @@ class SecurityDaemon:
 
             import base64, json as j
             sig_dict = j.loads(base64.b64decode(sig_bytes).decode("utf-8"))
-            if not verify_content_signature(content_str.encode("utf-8"), sig_dict, self.config, dil_priv, None):
+            if not verify_content_signature(content_str.encode("utf-8"), sig_dict, self.config, dil_pub, None):
                 logger.warning("Hash store signature invalid => ignoring.")
                 return
 
