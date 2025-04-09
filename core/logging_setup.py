@@ -1,19 +1,20 @@
+# logging_setup.py
 """
-Aepok Sentinel - Final Logging Setup
+Aepok Sentinel Logging Setup
 
 Provides a rotating, locked JSON logger that:
 1. Uses directory_contract to locate the logs directory (no arbitrary paths).
-2. Fails hard if the logs directory is missing (Flaws [75, 78]).
-3. Emits "LOG_ROTATED" to both the log file and the audit chain on rollover (Flaws [8, 83]).
+2. Fails immediately if the logs directory is missing.
+3. Emits a "LOG_ROTATED" event to the log file and the audit chain on rollover.
 4. Optionally suppresses console output in SCIF mode unless a manual debug override is allowed.
+5. Offers a get_logger(...) function to retrieve named loggers, ensuring
+   init_logging() has been called.
 
 References:
-- directory_contract.py: for `resolve_path("logs")`
-- audit_chain.py: for `append_event(...)`
-- Flaws addressed: [7], [8], [75–78], [83]
+- directory_contract.py (resolve_path("logs"))
+- audit_chain.py (append_event(...))
 """
 
-import os
 import sys
 import json
 import logging
@@ -25,6 +26,7 @@ from typing import Optional
 from aepok_sentinel.core import audit_chain
 from aepok_sentinel.core.directory_contract import resolve_path
 
+
 # Platform-specific locking imports
 if platform.system() == "Windows":
     import msvcrt
@@ -33,13 +35,15 @@ else:
 
 
 class LoggingSetupError(Exception):
-    """Raised if the logs directory is missing or log file can’t be opened."""
+    """
+    Raised if the logs directory is missing or the log file cannot be opened.
+    """
     pass
 
 
 class JSONLogFormatter(logging.Formatter):
     """
-    Formats log records as single-line JSON objects following:
+    Formats log records as single-line JSON objects:
     {
       "timestamp": "UTC iso8601",
       "subsystem": "<string>",
@@ -63,15 +67,13 @@ class JSONLogFormatter(logging.Formatter):
 
 class LockingRotatingFileHandler(RotatingFileHandler):
     """
-    A rotating handler that uses an exclusive file lock (Flaw [7] fix)
-    and emits a "LOG_ROTATED" event to both the log file and audit_chain
-    (Flaw [8], [83]) upon rollover.
+    A rotating handler that uses an exclusive file lock and emits a "LOG_ROTATED"
+    event to both the log file and the audit chain upon rollover.
     """
 
     def emit(self, record: logging.LogRecord) -> None:
         if self.stream is None:
             self.stream = self._open()
-
         self._lock_file(self.stream)
         try:
             super().emit(record)
@@ -100,12 +102,11 @@ class LockingRotatingFileHandler(RotatingFileHandler):
                 finally:
                     self._unlock_file(f)
 
-            # Also record an audit_chain event (Flaw [8], [83])
+            # Also record an audit_chain event for log rotation
             audit_chain.append_event(
                 event="LOG_ROTATED",
                 metadata={"logfile": new_log_path}
             )
-
         finally:
             if self.stream:
                 self._unlock_file(self.stream)
@@ -113,6 +114,7 @@ class LockingRotatingFileHandler(RotatingFileHandler):
     @staticmethod
     def _lock_file(file_obj):
         if platform.system() == "Windows":
+            # Lock one byte at current position
             msvcrt.locking(file_obj.fileno(), msvcrt.LK_LOCK, 1)
         else:
             fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
@@ -138,53 +140,49 @@ def init_logging(
     backup_count: int = 5
 ) -> None:
     """
-    Final-shape logging initializer.
-      - Resolves log directory via directory_contract (no external param).
-      - Fails if logs directory is missing (Flaws [75,78]).
-      - Uses LockingRotatingFileHandler with JSONLogFormatter.
-      - Optionally suppresses console for SCIF unless debug override is permitted.
-      - Logs and audit-chains "LOG_ROTATED" on rollover.
+    Initializes global logging for Aepok Sentinel.
+      - Resolves log directory via directory_contract (resolve_path("logs")).
+      - Fails if the logs directory is missing or inaccessible.
+      - Uses LockingRotatingFileHandler + JSONLogFormatter for file output.
+      - Optionally suppresses console in SCIF mode unless debug overrides are allowed.
+      - On rotation, emits a LOG_ROTATED event to the new log and the audit_chain.
 
-    :param scif_mode: If True, console logs are forcibly off unless
-                      debug_console and manual_override_allowed both True.
-    :param manual_override_allowed: If True, SCIF console is enabled if debug_console=True.
-    :param debug_console: If True, attempts console logs. SCIF can override if not permitted.
-    :param max_bytes: Rotation threshold in bytes (default = 5MB).
-    :param backup_count: Number of old logs to keep (default = 5).
+    :param scif_mode: True if operating in SCIF (airgap) mode; console might be suppressed.
+    :param manual_override_allowed: True if debug console can be explicitly allowed in SCIF.
+    :param debug_console: True if we want console logs (overridden by SCIF unless override is allowed).
+    :param max_bytes: Rotation threshold in bytes (default=5MB).
+    :param backup_count: Number of old log files to keep (default=5).
 
-    :raises LoggingSetupError: If logs directory is missing or log file can’t be opened.
+    :raises LoggingSetupError: If logs directory is missing or log file cannot be opened.
     """
 
     global _LOGGING_INITIALIZED, _FILE_HANDLER, _CONSOLE_HANDLER
     if _LOGGING_INITIALIZED:
-        return
+        return  # Already initialized
 
-    # Resolve the logs directory from directory_contract
     logs_dir = resolve_path("logs")
     if not logs_dir.is_dir():
         raise LoggingSetupError(
-            f"Logs directory not found at: {logs_dir}."
-            " This must be created at install time."
+            f"Logs directory not found at: {logs_dir}. "
+            "This must be pre-created at install time."
         )
 
     logfile = logs_dir / "sentinel.log"
 
-    # Test we can open the log file
     try:
         with open(logfile, "a", encoding="utf-8"):
             pass
     except Exception as e:
         raise LoggingSetupError(f"Cannot write to log file '{logfile}': {e}")
 
-    # Configure root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
 
-    # Remove any existing handlers
-    for h in list(root_logger.handlers):
-        root_logger.removeHandler(h)
+    # Remove existing handlers (if any)
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
 
-    # 1) File handler (locked + rotating)
+    # 1) File handler
     file_handler = LockingRotatingFileHandler(
         filename=str(logfile),
         mode="a",
@@ -215,3 +213,15 @@ def init_logging(
         console_enabled,
         logfile
     )
+
+
+def get_logger(name: str) -> logging.Logger:
+    """
+    Retrieves a logger instance by name. init_logging() must have been called
+    beforehand; otherwise, the logging system is uninitialized.
+    """
+    if not _LOGGING_INITIALIZED:
+        raise RuntimeError(
+            "Logging not initialized. Call init_logging(...) before get_logger(...)."
+        )
+    return logging.getLogger(name)
