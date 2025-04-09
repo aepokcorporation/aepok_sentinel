@@ -1,15 +1,27 @@
 # aepok_sentinel/core/key_manager_lock.py
 
-import os
+"""
+KeyRotationLock (Final Shape)
+
+Provides a cross-platform file lock used by KeyManager.rotate_keys() to ensure concurrency safety.
+ - If must_fail_on_error = True => raise on lock error
+ - Otherwise => log warning / degrade.
+
+This uses a simple approach:
+ - Windows => msvcrt.locking
+ - Unix => fcntl.flock
+No path auto-creation for the lock directory. If missing => fail or degrade per strict mode.
+"""
+
 import sys
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class KeyRotationLock:
     """
-    Cross-platform lockfile for final-shape key rotation concurrency.
-    On Windows, we open the file in exclusive mode.
-    On Unix, we use fcntl.flock(...).
-    If enforcement_mode is strict => fail if lock can't be acquired.
-    Otherwise we block until acquired.
+    A context manager for exclusive file locking in key rotation. 
     """
 
     def __init__(self, lockfile_path: str, must_fail_on_error: bool):
@@ -27,8 +39,13 @@ class KeyRotationLock:
                 import fcntl
                 fcntl.flock(self.fh, fcntl.LOCK_EX)
         except Exception as e:
+            msg = f"Failed to acquire rotation lock on {self.lockfile_path}: {e}"
+            logger.error(msg)
             if self.must_fail:
-                raise RuntimeError(f"Failed to acquire rotation lock: {e}")
+                raise RuntimeError(msg)
+            else:
+                # degrade => no lock
+                logger.warning("Proceeding without lock in permissive mode => concurrency risk.")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
