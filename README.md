@@ -324,7 +324,7 @@ This repository operates under a zero-guessing policy. PRs are only accepted if:
 
 www.aepokcorp.com
 
-Sentinel Inquiries: sentinel@aepokcorp.com
+Sentinel Inquiries: tyler@aepokcorp.com
 
 ## License
 
