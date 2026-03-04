@@ -18,16 +18,14 @@ Important:
  - For the lock, we use resolve_path("locks", "key_rotation.lock").
 """
 
-import os
 import shutil
 import time
 import datetime
 import json
 import base64
 import hashlib
-import logging
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 
 from aepok_sentinel.core.logging_setup import get_logger
 from aepok_sentinel.core.config import SentinelConfig
@@ -87,8 +85,8 @@ class KeyManager:
         # vendor_dilithium_priv.bin => for signing newly generated keys
         # vendor_dilithium_pub.pem => for verifying them if needed
         self.vendor_dil_priv_path = resolve_path("keys", "vendor_dilithium_priv.bin")
-        self.vendor_dil_pub_path  = resolve_path("keys", "vendor_dilithium_pub.pem")  # or .pub
-        # The code references `.bin`, but we'll unify to `.pem` if we prefer. 
+        self.vendor_dil_pub_path = resolve_path("keys", "vendor_dilithium_pub.pem")  # or .pub
+        # The code references `.bin`, but we'll unify to `.pem` if we prefer.
         # We'll just assume it is `.pem` for final shape.
 
     def fetch_current_keys(self) -> Dict[str, bytes]:
@@ -182,7 +180,7 @@ class KeyManager:
          - "cloud_dilithium_secret"
          - "cloud_kyber_secret"
          - "cloud_rsa_secret" (optional if allow_classical_fallback)
-        Return the dictionary. 
+        Return the dictionary.
         """
         if self.config.mode in ("scif", "airgap"):
             raise KeyManagerError("No network allowed in scif/airgap for cloud fetch.")
@@ -215,16 +213,16 @@ class KeyManager:
     def _load_local_keys_latest(self) -> Dict[str, bytes]:
         """
         Search for the newest <prefix>_*.bin or .pem for "kyber_priv", "dilithium_priv", "rsa_priv".
-        For each found file, read and verify with vendor_dilithium_pub.pem. 
+        For each found file, read and verify with vendor_dilithium_pub.pem.
         If missing or invalid => in strict => raise, else degrade to empty.
         """
         if not self.keys_dir.is_dir() and self._must_fail():
             raise KeyManagerError(f"Keys directory missing: {self.keys_dir}")
 
         # Find newest for each
-        kyber_path      = self._find_latest_key("kyber_priv", ".bin")
-        dilithium_path  = self._find_latest_key("dilithium_priv", ".bin")
-        rsa_path        = None
+        kyber_path = self._find_latest_key("kyber_priv", ".bin")
+        dilithium_path = self._find_latest_key("dilithium_priv", ".bin")
+        rsa_path = None
         if self.config.allow_classical_fallback:
             rsa_path = self._find_latest_key("rsa_priv", ".pem", required=False)
 
@@ -408,7 +406,7 @@ class KeyManager:
 
     def _verify_new_keys_tmp(self, tmp_dir: Path) -> None:
         """
-        Ensures the new keys in tmp_dir can be read & verified using _read_and_verify. 
+        Ensures the new keys in tmp_dir can be read & verified using _read_and_verify.
         Raises KeyManagerError if anything is invalid in strict/hardened.
         """
         must_have = ["kyber_priv.bin", "dilithium_priv.bin"]
@@ -608,7 +606,7 @@ class KeyManager:
         if not self.audit_chain:
             return
         try:
-            # fill standard fields: license_uuid from license_mgr. 
+            # fill standard fields: license_uuid from license_mgr.
             lic_info = self.license_mgr.license_state.info
             license_uuid = lic_info.get("license_uuid", "")
             metadata["license_uuid"] = license_uuid

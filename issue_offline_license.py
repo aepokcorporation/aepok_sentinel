@@ -31,7 +31,6 @@ import datetime
 import base64
 
 from aepok_sentinel.core.config import SentinelConfig
-from aepok_sentinel.core.pqc_crypto import sign_content_bundle, CryptoSignatureError
 from aepok_sentinel.core.azure_client import AzureClient, AzureClientError
 
 
@@ -40,7 +39,8 @@ def main():
         description="Offline license generator for Aepok Sentinel (final shape)."
     )
     parser.add_argument("--issued-to", required=True, help="Name/entity to which the license is issued.")
-    parser.add_argument("--expires-on", required=True, help="Expiration date (YYYY-MM-DD). Must be <= 10 years from today.")
+    parser.add_argument("--expires-on", required=True,
+                        help="Expiration date (YYYY-MM-DD). Must be <= 10 years from today.")
     parser.add_argument("--license-type", default="individual", choices=["individual", "site"],
                         help="License type. Defaults to 'individual'.")
     parser.add_argument("--max-installs", type=int, default=10,
@@ -183,7 +183,7 @@ def main():
     # Write .key file
     out_filename = f"{license_uuid}.key"
     out_path = os.path.join(args.out_dir, out_filename)
-    
+
     try:
         with open(out_path, "w", encoding="utf-8") as outf:
             outf.write(final_b64)

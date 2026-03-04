@@ -18,6 +18,7 @@ from aepok_sentinel.core.directory_contract import (
     REQUIRED_FILES,
 )
 
+
 @pytest.fixture
 def mock_runtime(tmp_path):
     """

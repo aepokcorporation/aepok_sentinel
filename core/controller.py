@@ -13,7 +13,7 @@ It handles:
 
 Typical usage:
   controller = SentinelController(
-      config_path="~/config/.sentinelrc", 
+      config_path="~/config/.sentinelrc",
       sentinel_runtime_base="/opsec/aepok_sentinel/runtime",
       state_path="~/controller_state.json"
   )
@@ -24,26 +24,24 @@ Typical usage:
 
 import os
 import json
-import logging
 import threading
 import time
 import datetime
 import shutil
+from pathlib import Path
 from typing import Optional, Dict, Any
 
 from aepok_sentinel.core.logging_setup import get_logger
 from aepok_sentinel.core.directory_contract import validate_runtime_structure
 from aepok_sentinel.core.directory_contract import resolve_path
 from aepok_sentinel.core.config import SentinelConfig
-from aepok_sentinel.core.license import LicenseManager, LicenseError, is_watch_only
+from aepok_sentinel.core.license import LicenseManager, LicenseError
 from aepok_sentinel.core.key_manager import KeyManager, KeyManagerError
-from aepok_sentinel.core.audit_chain import AuditChain, ChainTamperDetectedError
+from aepok_sentinel.core.audit_chain import AuditChain
 from aepok_sentinel.core.security_daemon import SecurityDaemon
 from aepok_sentinel.core.autoban import AutobanManager
 from aepok_sentinel.core.constants import EventCode
 from aepok_sentinel.core.pqc_crypto import verify_content_signature
-from aepok_sentinel.core.pqc_crypto import CryptoSignatureError
-from aepok_sentinel.core.pqc_crypto import sign_content_bundle, CryptoDecryptionError
 
 logger = get_logger("controller")
 
@@ -76,7 +74,8 @@ class SentinelController:
         ...
         controller.stop()
 
-    If enforcement_mode is STRICT or HARDENED, any missing or invalid signatures will cause a hard fail (ControllerError).
+    If enforcement_mode is STRICT or HARDENED, any missing or invalid signatures
+    will cause a hard fail (ControllerError).
     In PERMISSIVE mode, the system logs warnings and continues in a degraded state.
     """
 
@@ -255,7 +254,7 @@ class SentinelController:
 
         sig_path = self.config_path + ".sig"
         if not os.path.isfile(sig_path):
-            msg = f".sentinelrc.sig missing => cannot verify config in strict/hardened."
+            msg = ".sentinelrc.sig missing => cannot verify config in strict/hardened."
             logger.warning(msg)
             if self._must_fail():
                 raise ControllerError(msg)
@@ -679,7 +678,8 @@ class SentinelController:
 
     def _chain_event(self, event: EventCode, metadata: Dict[str, Any]) -> None:
         """
-        Append an event to the audit chain, if available. Attaches enforcement_mode, host_fingerprint, license_uuid, and a UTC timestamp.
+        Append an event to the audit chain, if available. Attaches enforcement_mode,
+        host_fingerprint, license_uuid, and a UTC timestamp.
         """
         if self.config:
             metadata["enforcement_mode"] = getattr(self.config, "enforcement_mode", "UNKNOWN")
@@ -744,7 +744,8 @@ class SentinelController:
 
     def _save_state(self, extra: dict) -> None:
         """
-        Update a small JSON with the given 'extra' fields, ignoring errors in permissive mode or raising in strict/hard if desired.
+        Update a small JSON with the given 'extra' fields, ignoring errors in
+        permissive mode or raising in strict/hard if desired.
         """
         state = {}
         if os.path.isfile(self.state_path):

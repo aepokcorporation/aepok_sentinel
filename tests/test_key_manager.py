@@ -128,7 +128,8 @@ class TestKeyManagerFinalShape(unittest.TestCase):
     def test_fetch_cloud_keys_ok(self, mock_get):
         self.cfg.raw_dict["cloud_keyvault_enabled"] = True
         self.cfg.raw_dict["mode"] = "cloud"
-        mock_get.side_effect = ["ZGlsX2RhdGE=", "a3liZXJfZGF0YQ==", "cnNhX2RhdGE="]  # base64 of "dil_data", "kyber_data", "rsa_data"
+        # base64 of "dil_data", "kyber_data", "rsa_data"
+        mock_get.side_effect = ["ZGlsX2RhdGE=", "a3liZXJfZGF0YQ==", "cnNhX2RhdGE="]
         keys = self.km.fetch_current_keys()
         self.assertEqual(keys["dilithium_priv"], b"dil_data")
         self.assertEqual(keys["kyber_priv"], b"kyber_data")

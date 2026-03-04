@@ -8,6 +8,7 @@ Contains:
 
 from enum import Enum, unique
 
+
 @unique
 class EventCode(Enum):
     """

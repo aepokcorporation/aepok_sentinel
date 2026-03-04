@@ -3,10 +3,14 @@
 PQC TLS Transport Layer for Aepok Sentinel
 
 Provides:
-  - create_pqc_ssl_context(config): Builds an SSLContext for TLS 1.3 with optional PQC/hybrid groups.
-  - connect_pqc_socket(config, hostname, port): Connects a TCP socket, wraps it with PQC SSL, and logs the negotiated group.
-  - _get_negotiated_group(tls_sock): Internal helper to retrieve the actual TLS group used in the handshake via CFFI calls.
-  - _set_supported_groups(ctx, config): Internal helper to configure the SSLContext with named groups from config.tls_mode.
+  - create_pqc_ssl_context(config): Builds an SSLContext for TLS 1.3 with
+    optional PQC/hybrid groups.
+  - connect_pqc_socket(config, hostname, port): Connects a TCP socket, wraps
+    it with PQC SSL, and logs the negotiated group.
+  - _get_negotiated_group(tls_sock): Internal helper to retrieve the actual
+    TLS group used in the handshake via CFFI calls.
+  - _set_supported_groups(ctx, config): Internal helper to configure the
+    SSLContext with named groups from config.tls_mode.
   - _log_tls_session_event(...): Logs session details to the audit chain.
 
 Handles:
@@ -18,7 +22,6 @@ Handles:
 import ssl
 import socket
 import hashlib
-import logging
 from typing import Optional
 
 import cffi
@@ -67,7 +70,7 @@ class PQCTlsError(Exception):
 def create_pqc_ssl_context(config: SentinelConfig) -> ssl.SSLContext:
     """
     Creates an SSLContext for TLS 1.3 with optional PQC/hybrid groups,
-    disabling session tickets and older TLS versions. 
+    disabling session tickets and older TLS versions.
     Raises PQCTlsError if strict_transport is set and group configuration fails.
     """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -88,7 +91,8 @@ def create_pqc_ssl_context(config: SentinelConfig) -> ssl.SSLContext:
     return ctx
 
 
-def connect_pqc_socket(config: SentinelConfig, hostname: str, port: int, timeout: float = 10.0, audit_chain: Optional[AuditChain] = None) -> ssl.SSLSocket:
+def connect_pqc_socket(config: SentinelConfig, hostname: str, port: int, timeout: float = 10.0,
+                       audit_chain: Optional[AuditChain] = None) -> ssl.SSLSocket:
     """
     Creates a PQC SSLContext, then connects to (hostname, port) via TCP and wraps in SSL.
     Logs the negotiated group + certificate fingerprint to the audit chain.

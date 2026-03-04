@@ -82,7 +82,7 @@ class TestSecurityDaemon(unittest.TestCase):
         rec2 = json.loads(lines[1])
         # first is storing hash => no event
         # second => TAMPER_DETECTED
-        # Actually we get MALWARE_MATCH or TAMPER_DETECTED only if detected. 
+        # Actually we get MALWARE_MATCH or TAMPER_DETECTED only if detected.
         # Here it’s a tamper => TAMPER_DETECTED
         self.assertEqual(rec2["event"], "TAMPER_DETECTED")
 

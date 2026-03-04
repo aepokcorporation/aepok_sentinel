@@ -20,7 +20,6 @@ import os
 import time
 import json
 import shutil
-import logging
 import hashlib
 import threading
 import datetime
@@ -80,9 +79,11 @@ class SecurityDaemon:
         self.config = config
         self.license_mgr = license_mgr
         self.audit_chain = audit_chain
-        self.hash_store_path = hash_store_path if hash_store_path is not None else resolve_path("security", ".hashes.json")
+        self.hash_store_path = hash_store_path if hash_store_path is not None else resolve_path(
+            "security", ".hashes.json")
         self.quarantine_dir = quarantine_dir if quarantine_dir is not None else resolve_path("quarantine")
-        self.sign_priv_key_path = sign_priv_key_path if sign_priv_key_path is not None else resolve_path("security", "daemon_dilithium_priv.bin")
+        self.sign_priv_key_path = sign_priv_key_path if sign_priv_key_path is not None else resolve_path(
+            "security", "daemon_dilithium_priv.bin")
         self.autoban_mgr = autoban_mgr
 
         if not self.quarantine_dir.is_dir():
@@ -245,13 +246,14 @@ class SecurityDaemon:
     # ------------------------------
     def _process_file(self, filepath: str) -> None:
         """
-        Compares file hash to stored hash. Checks for tamper or malware. 
+        Compares file hash to stored hash. Checks for tamper or malware.
         If intrusion_source is found, calls autoban. Quarantines if not watch-only and tamper/malware is detected.
         """
         tampered, threat, meta = self._analyze_file(filepath)
         intrusion_source = meta.get("intrusion_source")
         if intrusion_source and self.autoban_mgr:
-            reason_str = f"{intrusion_source['type']}:{threat or 'tamper'}" if (tampered or threat) else intrusion_source['type']
+            reason_str = f"{intrusion_source['type']}:{threat or 'tamper'}" if (
+                tampered or threat) else intrusion_source['type']
             self.autoban_mgr.record_bad_source(intrusion_source["value"], reason_str)
 
         # watch-only => skip quarantine, but log
@@ -330,7 +332,7 @@ class SecurityDaemon:
         timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         composite_name = f"{basename}__{sha256}__{timestamp}"
         q_path = self.quarantine_dir / composite_name
-        
+
         try:
             shutil.move(filepath, q_path)
         except Exception as e:
@@ -429,7 +431,8 @@ class SecurityDaemon:
                 logger.warning("Missing/unreadable vendor_dilithium_pub.pem for hash store verify: %s", e)
                 return
 
-            import base64, json as j
+            import base64
+            import json as j
             sig_dict = j.loads(base64.b64decode(sig_bytes).decode("utf-8"))
             if not verify_content_signature(content_str.encode("utf-8"), sig_dict, self.config, dil_pub, None):
                 logger.warning("Hash store signature invalid => ignoring.")
@@ -507,7 +510,7 @@ class SecurityDaemon:
                 logger.warning("Enforcing fallback: all scan targets will be quarantined on next pass.")
                 # Clear the hash store to trigger tamper detection on all future files
                 self._hash_store.clear()
-                
+
     def _initialize_hash_seen_table(self) -> None:
         now = datetime.datetime.utcnow().isoformat() + "Z"
         for path, hval in self._hash_store.items():

@@ -15,6 +15,7 @@ from aepok_sentinel.core.constants import (
     LOG_BACKUP_COUNT
 )
 
+
 class TestConstants(unittest.TestCase):
     def test_event_code_enum(self):
         # Basic presence checks

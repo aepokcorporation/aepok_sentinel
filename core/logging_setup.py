@@ -149,7 +149,6 @@ class LockingRotatingFileHandler(RotatingFileHandler):
         # ensuring overlapping coverage regardless of where each process
         # is writing.
         if platform.system() == "Windows":
-            import os
             fd = file_obj.fileno()
             file_obj.seek(0, 2)  # seek to end to get size
             size = max(file_obj.tell(), 1)

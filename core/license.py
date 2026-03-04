@@ -8,16 +8,16 @@ Responsibilities:
  - Validate expiration, max_installs, and optional hardware binding.
  - Maintain and sign an install_state.json to record usage count per license UUID.
  - Emit chain events for LICENSE_ACTIVATED, LICENSE_INVALID, LICENSE_EXPIRED, INSTALL_REJECTED, etc.
- - In strict/hardened modes or if license_required=True, a failure to validate the license results in an immediate error rather than a watch-only mode.
+ - In strict/hardened modes or if license_required=True, a failure to validate
+   the license results in an immediate error rather than a watch-only mode.
 
 Note: The system expects the final license blob to be base64-encoded JSON with a "signature" field
-(e.g. produced by issue_offline_license.py). 
+(e.g. produced by issue_offline_license.py).
 """
 
 import os
 import json
 import base64
-import hashlib
 import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -25,7 +25,7 @@ from typing import Optional, Dict, Any
 from aepok_sentinel.core.logging_setup import get_logger
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.pqc_crypto import (
-    verify_content_signature, CryptoSignatureError, sign_content_bundle
+    verify_content_signature, sign_content_bundle
 )
 from aepok_sentinel.core.audit_chain import AuditChain
 from aepok_sentinel.core.constants import EventCode
@@ -304,7 +304,7 @@ class LicenseManager:
     def _check_hardware_binding(self, lic_json: dict) -> bool:
         """Compare lic_json['bound_to'] with the local host identity fingerprint in identity.json."""
         # read identity
-        # We assume identity.json is guaranteed to exist. If not, fail. In strict mode => error. 
+        # We assume identity.json is guaranteed to exist. If not, fail. In strict mode => error.
         try:
             content = self.identity_path.read_text(encoding="utf-8")
             ident_data = json.loads(content)
@@ -323,7 +323,7 @@ class LicenseManager:
 
     def _check_install_count(self, lic_json: dict) -> bool:
         """
-        Looks up or creates a record in install_state for the license. 
+        Looks up or creates a record in install_state for the license.
         If host is new, increments usage. If usage > max_installs => fail with INSTALL_REJECTED event.
         """
         license_uuid = lic_json.get("license_uuid", "")
@@ -374,7 +374,7 @@ class LicenseManager:
     # ---------------------------------------------
     def _load_install_state(self) -> Dict[str, Dict[str, Any]]:
         """
-        Reads install_state.json and its signature if present. 
+        Reads install_state.json and its signature if present.
         In strict/hardened => missing or invalid signature => raises.
         Otherwise => degrade to empty usage state.
         """
