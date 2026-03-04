@@ -124,11 +124,22 @@ def encrypt_file_payload(
     validate_rng()
 
     # 1) Kyber encaps to obtain shared_secret => AES key
+    #
+    # FIX #39: The previous code passed kyber_pub as the second argument to
+    # oqs.KeyEncapsulation("Kyber512", kyber_pub).  The liboqs Python
+    # wrapper's constructor signature is KeyEncapsulation(alg_name,
+    # secret_key=None) — the second parameter is the SECRET key, not the
+    # public key.  Passing a public key as if it were a secret key caused
+    # either silent corruption or an error depending on the oqs version.
+    #
+    # For encapsulation we do NOT need a secret key — we only need the
+    # public key, which is passed to kem.encap_secret(kyber_pub).  The
+    # constructor should be called with the algorithm name only.
     aes_key = b""
     wrapped_kyber = b""
     shared_secret = b""
     try:
-        with oqs.KeyEncapsulation("Kyber512", kyber_pub) as kem:
+        with oqs.KeyEncapsulation("Kyber512") as kem:
             wrapped_kyber, shared_secret = kem.encap_secret(kyber_pub)
         aes_key = hashlib.sha256(shared_secret).digest()
     except Exception as e:
@@ -251,6 +262,17 @@ def decrypt_file_payload(
     kyber_failed = False
 
     # 1) Kyber decapsulation
+    #
+    # FIX #40 (documentation): The constructor call here is CORRECT — for
+    # decapsulation, KeyEncapsulation("Kyber512", kyber_priv) passes the
+    # secret key as the second argument, which is exactly what liboqs
+    # expects.  decap_secret() then uses that secret key to decapsulate
+    # the wrapped ciphertext.
+    #
+    # This is now consistent with #39's fix: encrypt uses the constructor
+    # WITHOUT a key (encapsulation only needs the public key passed to
+    # encap_secret), while decrypt passes the SECRET key to the constructor
+    # (decapsulation requires the secret key to unwrap).
     try:
         with oqs.KeyEncapsulation("Kyber512", kyber_priv) as kem:
             shared_secret = kem.decap_secret(wrapped_kyber)

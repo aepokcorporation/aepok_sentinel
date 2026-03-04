@@ -119,20 +119,26 @@ class SentinelConfig:
         """
         If user_path resides inside the runtime directory, unify it to
         resolve_path("license", "license.key"). Otherwise, accept as-is.
+
+        FIX #32: The previous implementation called resolve_path() with no
+        arguments (which just returns SENTINEL_RUNTIME_BASE) and then used
+        string startswith() for path containment — a fragile approach that
+        could false-positive on paths like /opsec/aepok_sentinel/runtime2/.
+        Now uses Path.relative_to() for robust parentage checking.
         """
-        runtime_base = resolve_path()  # <runtime> with no parts
-        # If the config path doesn't exist or is outside runtime, keep it.
-        # But if it leads inside runtime, unify:
+        from aepok_sentinel.core.directory_contract import SENTINEL_RUNTIME_BASE
+        runtime_base = SENTINEL_RUNTIME_BASE.resolve()
         try:
             candidate = Path(user_path).resolve()
-            if str(candidate).startswith(str(runtime_base)):
-                # Force it to the contract location
-                return str(resolve_path("license", "license.key"))
-            else:
-                return user_path
+            # Use proper Path parentage check instead of string startswith
+            candidate.relative_to(runtime_base)
+            # Path is inside the runtime tree → force it to contract location
+            return str(resolve_path("license", "license.key"))
+        except ValueError:
+            # candidate is NOT under runtime_base → keep user's path as-is
+            return user_path
         except Exception:
             # If some weird parse error occurs, just keep the user_path
-            # (the system might handle or fail on its own if invalid).
             return user_path
 
     def _validate_schema_version(self) -> None:
