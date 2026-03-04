@@ -155,7 +155,7 @@ class SentinelController:
         # retrieve stable host fingerprint
         # if fails => possibly raise in strict
         try:
-            from aepok_sentinel.core.identity import get_host_fingerprint  # hypothetical
+            from aepok_sentinel.core.identity import get_host_fingerprint
             self._host_fingerprint = get_host_fingerprint(self.sentinel_runtime_base)
         except Exception as e:
             logger.warning("Failed to get host fingerprint: %s", e)
@@ -571,7 +571,8 @@ class SentinelController:
             pqc_pub_keys=pqc_pub,
             max_size_bytes=100 * 1024 * 1024,
             background_verification_interval=0,
-            anchor_config=anchor_config
+            anchor_config=anchor_config,
+            chain_dir=chain_path
         )
         # Register the chain as the module-level singleton so that
         # audit_chain.append_event() (the free function) works for other

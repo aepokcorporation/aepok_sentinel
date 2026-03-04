@@ -26,6 +26,7 @@ from shutil import which
 from hashlib import sha256
 
 from aepok_sentinel.core.logging_setup import get_logger
+from aepok_sentinel.core.directory_contract import resolve_path
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, is_watch_only
 from aepok_sentinel.core.audit_chain import AuditChain

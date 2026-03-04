@@ -172,26 +172,52 @@ def _get_negotiated_group(tls_sock: ssl.SSLSocket) -> str:
     """
     Retrieves the actual group used in handshake via SSL_get_shared_group(ssl, 0).
     Returns "unknown_group" if retrieval fails or is unsupported.
+
+    Modern Python's ssl module does not expose the raw SSL* as an integer.
+    The internal _sslobj._sslobj (an _ssl._SSLSocket C extension object)
+    wraps the OpenSSL SSL* as its first struct member after the standard
+    CPython PyObject header.  We use ctypes to read that pointer so the
+    CFFI call to SSL_get_shared_group receives a valid address.
     """
-    sslobj = getattr(tls_sock, "_sslobj", None)
-    if not sslobj:
-        return "unknown_group"
-
-    real_ssl = getattr(sslobj, "_ssl", None)
-    if real_ssl is None or not isinstance(real_ssl, int):
-        return "unknown_group"
-
     if not _libssl or not _libcrypto:
         return "unknown_group"
 
-    grp_nid = _libssl.SSL_get_shared_group(_ffi.cast("SSL*", real_ssl), 0)
-    if grp_nid <= 0:
-        return "unknown_group"
+    try:
+        # Navigate Python's SSL wrapper layers:
+        #   SSLSocket._sslobj  -> ssl.SSLObject (Python wrapper)
+        #   SSLObject._sslobj  -> _ssl._SSLSocket (C extension object)
+        sslobj = getattr(tls_sock, "_sslobj", None)
+        if sslobj is None:
+            return "unknown_group"
 
-    c_sn = _libcrypto.OBJ_nid2sn(grp_nid)
-    if c_sn == _ffi.NULL:
+        inner = getattr(sslobj, "_sslobj", sslobj)
+
+        # Try the legacy path first: if _ssl is already an int, use it directly
+        raw_attr = getattr(inner, "_ssl", None)
+        if isinstance(raw_attr, int) and raw_attr != 0:
+            ssl_ptr = raw_attr
+        elif inner is not None:
+            # Modern CPython: inner is an _ssl._SSLSocket whose C struct
+            # stores SSL* as the first field after the PyObject header
+            # (ob_refcnt + *ob_type = 2 pointer-sized words).
+            import ctypes as _ct
+            header_size = _ct.sizeof(_ct.c_ssize_t) + _ct.sizeof(_ct.c_void_p)
+            ssl_ptr = _ct.c_void_p.from_address(id(inner) + header_size).value
+            if not ssl_ptr:
+                return "unknown_group"
+        else:
+            return "unknown_group"
+
+        grp_nid = _libssl.SSL_get_shared_group(_ffi.cast("SSL*", ssl_ptr), 0)
+        if grp_nid <= 0:
+            return "unknown_group"
+
+        c_sn = _libcrypto.OBJ_nid2sn(grp_nid)
+        if c_sn == _ffi.NULL:
+            return "unknown_group"
+        return _ffi.string(c_sn).decode("ascii")
+    except Exception:
         return "unknown_group"
-    return _ffi.string(c_sn).decode("ascii")
 
 
 def _log_tls_session_event(
