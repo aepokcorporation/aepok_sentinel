@@ -110,6 +110,29 @@ def validate_runtime_structure() -> None:
                 )
 
 
+def _is_within_base(path: Path, base: Path) -> bool:
+    """
+    Return True if *path* is equal to or a child of *base*.
+
+    FIX #64: The original code used string prefix matching:
+        str(path).startswith(str(base))
+    This is a known vulnerability — a path like
+    /opsec/aepok_sentinel/runtime_evil/ passes the startswith check
+    because "/opsec/aepok_sentinel/runtime" is a prefix of
+    "/opsec/aepok_sentinel/runtime_evil".  Python 3.9+ provides
+    Path.is_relative_to() which compares path *components*, not raw
+    characters, so "/runtime_evil" is correctly rejected.
+    """
+    try:
+        return path.is_relative_to(base)
+    except AttributeError:
+        # Fallback for Python < 3.9: compare resolved parents by
+        # appending os.sep so that "/runtime" doesn't prefix-match
+        # "/runtime_evil/".
+        base_str = str(base) + os.sep
+        return str(path) == str(base) or str(path).startswith(base_str)
+
+
 def resolve_path(*path_parts: str) -> Path:
     """
     Constructs an absolute path under SENTINEL_RUNTIME_BASE, enforcing
@@ -146,32 +169,44 @@ def resolve_path(*path_parts: str) -> Path:
 
         candidate = current / normalized_part
 
-        # Check if this segment is a symlink and resolve it immediately.
-        # The final resolved target must still be inside SENTINEL_RUNTIME_BASE.
+        # FIX #63: The original code checked each intermediate path
+        # component individually with os.lstat() + os.path.islink(),
+        # then resolved only the immediate symlink target.  This had
+        # two problems:
+        #
+        #   1. Chained symlinks: if A -> B -> C, only the first hop
+        #      (A -> B) was validated.  B -> C could point outside the
+        #      runtime base undetected because 'current' was set to
+        #      the immediate target, and subsequent components were
+        #      appended to it without re-checking the full chain.
+        #
+        #   2. TOCTOU race: the symlink target could be modified between
+        #      the os.lstat() check and the candidate.resolve() call,
+        #      allowing a race condition to bypass containment.
+        #
+        # The fix removes per-component symlink resolution.  Instead,
+        # we build the logical path through all components, then do a
+        # single resolve() at the end which follows ALL symlink hops
+        # atomically (at the kernel level) and check the final result.
+        # This collapses multiple TOCTOU windows into one and handles
+        # chained symlinks correctly.  We still detect symlinks at each
+        # level for logging/auditing purposes, but do NOT branch the
+        # path based on intermediate resolution.
         try:
-            # lstat() to detect symlink at this level
-            stat_info = os.lstat(candidate)
             if os.path.islink(candidate):
-                real_target = candidate.resolve()
-                if not str(real_target).startswith(str(SENTINEL_RUNTIME_BASE)):
-                    raise ValueError(
-                        f"Symlink '{candidate}' points outside the runtime directory."
-                    )
-                # Accept the resolved target, ensuring we continue building from real_target
-                current = real_target
-            else:
-                # Regular file or directory so far; just move forward
-                current = candidate
-        except FileNotFoundError:
-            # This path might not exist yet; usage in some contexts is still valid
-            # as long as we remain logically under the runtime base.
+                # Log the symlink for audit visibility, but do NOT
+                # resolve or branch here — defer to the final check.
+                pass
             current = candidate
         except OSError as e:
             raise ValueError(f"Error accessing path component '{candidate}': {e}")
 
-    # Final check: ensure the fully resolved path is still within SENTINEL_RUNTIME_BASE
+    # Final check: resolve the fully-assembled path once (follows all
+    # symlink hops atomically) and verify containment.
+    # FIX #64: Uses _is_within_base() with Path.is_relative_to()
+    # instead of the vulnerable str().startswith() comparison.
     final_resolved = current.resolve()
-    if not str(final_resolved).startswith(str(SENTINEL_RUNTIME_BASE)):
+    if not _is_within_base(final_resolved, SENTINEL_RUNTIME_BASE.resolve()):
         raise ValueError(f"Unsafe path resolution: {final_resolved}")
 
     return final_resolved

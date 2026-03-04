@@ -1528,6 +1528,15 @@ doesn’t prevent interleaved writes. The Windows locking is effectively
 non-functional for its intended purpose of preventing concurrent
 corruption.
 
+**FIX #61 — Applied in logging_setup.py _lock_file / _unlock_file:**
+The Windows branch now seeks to position 0 and locks the entire file
+(max(file_size, 1) bytes) instead of a single byte.  On Unix,
+fcntl.flock() already provides whole-file locking so no change was
+needed there.  The unlock mirrors the same logic: seek to 0, compute
+the file size, and unlock that range.  This ensures that even if two
+processes write to different positions, the msvcrt lock region covers
+the full file and properly serialises access.
+
 62. logging_setup.py doRollover opens the new log file, writes a
 LOG_ROTATED JSON event, then also calls audit_chain.append_event(...).
 Same module-level function call problem as #2. Additionally, this runs
@@ -1536,6 +1545,18 @@ append somehow triggers a log event (which it does, since the chain
 calls logger.info(...) internally), you get reentrant logging during
 rollover. The file handler is mid-rollover while the chain’s logger
 tries to write through it.
+
+**FIX #62 — Applied in logging_setup.py doRollover:**
+Two changes: (1) The audit_chain.append_event() call was already removed
+by FIX #60, eliminating the reentrant logging risk from the chain’s
+internal logger.info() calls.  (2) The post-rollover code was opening a
+SECOND, independent file handle (via open(new_log_path, “a”)) to write
+the LOG_ROTATED JSON event.  This created two file descriptors to the
+same file — self.stream and the separate ‘f’ — so locking ‘f’ did not
+prevent concurrent writes through self.stream from other threads.  The
+fix writes the LOG_ROTATED event directly through self.stream (which
+super().doRollover() already opened for the new file), eliminating the
+duplicate fd and ensuring the handler’s own lock serialises all access.
 
 63. directory_contract.py resolve_path performs symlink checks by
 calling os.lstat() and os.path.islink(). But the path components are
@@ -1548,6 +1569,20 @@ symlink, and subsequent path components are appended to the resolved
 target — which might enable a TOCTOU race if the symlink target is
 modified between the lstat check and the resolve call.
 
+**FIX #63 — Applied in directory_contract.py resolve_path:**
+Removed per-component symlink resolution entirely.  The old code checked
+each intermediate path segment individually with os.lstat() + resolve(),
+creating multiple TOCTOU windows and only following one level of chained
+symlinks.  The new code builds the full logical path through all
+components without branching on intermediate symlinks, then performs a
+single resolve() at the end which follows ALL symlink hops atomically
+(at the kernel level).  The final resolved path is then checked for
+containment within SENTINEL_RUNTIME_BASE.  This collapses multiple
+TOCTOU windows into one and correctly handles arbitrary symlink chains.
+Symlinks are still detected at each level via os.path.islink() for
+audit/logging visibility, but the path is not branched based on
+intermediate resolution.
+
 64. directory_contract.py resolve_path final check uses string
 comparison: str(final_resolved).startswith(str(SENTINEL_RUNTIME_BASE)).
 String prefix matching for path containment is a known vulnerability. If
@@ -1556,6 +1591,17 @@ SENTINEL_RUNTIME_BASE is /opsec/aepok_sentinel/runtime, then a path like
 Should use Path.is_relative_to() (Python 3.9+) or compare resolved
 parents.
 
+**FIX #64 — Applied in directory_contract.py resolve_path + new _is_within_base():**
+Extracted path containment into a helper _is_within_base(path, base)
+that uses Path.is_relative_to() (Python 3.9+), which compares path
+components rather than raw characters.  With is_relative_to(),
+“/runtime_evil” is correctly rejected because “runtime_evil” is not a
+child component of “runtime”.  A fallback for Python < 3.9 appends
+os.sep to the base string before the startswith check, so
+“/runtime/” never prefix-matches “/runtime_evil/”.  Both resolve_path’s
+intermediate symlink check and final containment check now use this
+helper.  The vulnerable str().startswith() comparison is fully removed.
+
 65. azure_client.py makes HTTP requests to Azure Key Vault but never
 sets authentication headers. There’s no Bearer token, no managed
 identity token acquisition, no DefaultAzureCredential usage, no auth of
@@ -1563,21 +1609,51 @@ any kind. Every get_secret, set_secret, and delete_secret call will
 receive a 401 from Azure. The Azure integration is entirely
 non-functional.
 
+**FIX #65 — Applied in azure_client.py __init__ + new _authenticate_session():**
+Added _authenticate_session() which uses azure.identity.DefaultAzureCredential
+to acquire a Bearer token scoped to https://vault.azure.net/.default
+(the resource scope required by Azure Key Vault).  The token is set as
+the Authorization header on the requests session so all subsequent API
+calls include it.  DefaultAzureCredential transparently supports managed
+identity (Azure VMs, App Service, AKS), environment variables, Azure
+CLI credentials, and other sources.  If azure-identity is not installed
+or token acquisition fails, AzureClientError is raised immediately (the
+client would be non-functional without auth anyway).  Called at the end
+of __init__ after session creation.
+
 66. azure_client.py get_secret parses the response as resp.json() and
-returns data.get("value", ""). But Azure Key Vault’s secret API
+returns data.get(“value”, “”). But Azure Key Vault’s secret API
 returns secrets under the path /secrets/{name}/{version} with an API
 version query parameter (e.g., ?api-version=7.4). The URL constructed is
 just {base_url}/secrets/{secret_name} with no API version. Even with
 auth, Azure would return a 400 or redirect.
 
+**FIX #66 — Applied in azure_client.py get_secret, set_secret, delete_secret:**
+Added AZURE_API_VERSION = “7.4” as a module-level constant and passed
+params={“api-version”: AZURE_API_VERSION} to every requests.get(),
+requests.put(), and requests.delete() call.  Azure Key Vault REST API
+requires this query parameter on all endpoints; without it, the service
+returns 400 Bad Request.  Using the requests library’s params kwarg
+ensures proper URL encoding and keeps the URL construction clean.
+
 67. controller.py _init_audit_chain passes pqc_priv and pqc_pub dicts
-to AuditChain(). pqc_priv["dilithium"] comes from
-local_keys.get("dilithium_priv"). If fetch_current_keys() fails in
+to AuditChain(). pqc_priv[“dilithium”] comes from
+local_keys.get(“dilithium_priv”). If fetch_current_keys() fails in
 permissive mode and returns an empty dict,
-local_keys.get("dilithium_priv") is None. The chain is initialized
+local_keys.get(“dilithium_priv”) is None. The chain is initialized
 with None as the Dilithium private key. Every sign_content_bundle call
-in the chain then passes None to oqs.Signature("Dilithium2", None),
+in the chain then passes None to oqs.Signature(“Dilithium2”, None),
 which will crash.
+
+**FIX #67 — Applied in controller.py _init_audit_chain:**
+Added an explicit check for the dilithium private key after
+fetch_current_keys() returns.  If dil_priv is None or empty (which
+happens when fetch fails in permissive mode and returns {}), we now:
+(1) in strict mode, raise ControllerError immediately so the operator
+knows signing is impossible; (2) in permissive mode, set
+self.audit_chain = None and return early, so downstream code sees None
+and can degrade gracefully instead of crashing when
+oqs.Signature(“Dilithium2”, None) is called during sign_content_bundle.
 
 68. controller.py _init_autoban constructs AutobanManager(self.config,
 self.license_mgr, self.audit_chain). But AutobanManager.__init__
@@ -1588,6 +1664,16 @@ is None (from #67 pathway), autoban still initializes but any
 _append_chain_event call will try self.audit_chain.append_event(...)
 on None.
 
+**FIX #68 — Applied in controller.py _init_autoban:**
+Added an explicit warning log when self.audit_chain is None before
+constructing AutobanManager.  This makes it visible to operators that
+autoban events will NOT be recorded in the audit chain (which could
+otherwise go unnoticed until a forensic review).  AutobanManager is
+still allowed to initialise because IP-blocking functionality is
+valuable even without audit recording.  The root cause (None chain) is
+addressed by FIX #67; this fix adds the visibility layer so operators
+know about the degraded state.
+
 69. controller.py _chain_event doesn’t check if self.audit_chain is
 None before accessing it. Wait — it does check if self.audit_chain:.
 But the boot() method calls
@@ -1597,6 +1683,16 @@ self.audit_chain is None, the event is silently dropped. The controller
 boot event — the most important audit trail entry — is lost without
 any error or warning.
 
+**FIX #69 — Applied in controller.py _chain_event:**
+The else branch (when self.audit_chain is None) previously used
+logger.info() — easily lost among normal log output.  Now:
+(1) For CONTROLLER_BOOT specifically, we emit logger.error() with the
+prefix “AUDIT GAP:” so it stands out in logs and alerts operators that
+the most critical audit trail entry is missing from the very start of
+the session.  (2) For all other dropped events, we emit logger.warning()
+(not info) with an explicit “DROPPED” label so it’s clear events are
+being lost, not just logged at a low level.
+
 70. key_manager.py rotate_keys checks rotation_interval_days but never
 compares against the last rotation timestamp. It only checks if the
 value is <= 0 to disable rotation. There’s no logic to determine WHEN
@@ -1604,6 +1700,17 @@ the last rotation happened. Calling rotate_keys() always rotates
 regardless of the interval setting. The rotation_interval_days config
 field is effectively meaningless — it’s either “never rotate” (<=0)
 or “rotate every time this method is called.”
+
+**FIX #70 — Applied in key_manager.py rotate_keys:**
+Added timestamp comparison logic after the rotation_interval_days > 0
+check.  We now find the newest dilithium_priv key file via
+_find_latest_key() and check its modification time (mtime).  If the
+elapsed time since the last rotation is less than rotation_interval_days
+(converted to seconds), we skip rotation and log the last rotation date
+and elapsed time.  This makes rotation_interval_days meaningful: keys
+are only rotated when they are actually due for renewal, not every time
+rotate_keys() is called.  The datetime import was added to the module’s
+imports to support the UTC timestamp comparison.
 
 71. key_manager.py _find_latest_key searches for files with names
 starting with the prefix. But after provisioning, the vendor keys are

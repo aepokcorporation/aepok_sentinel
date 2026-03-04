@@ -21,6 +21,7 @@ Important:
 import os
 import shutil
 import time
+import datetime
 import json
 import base64
 import hashlib
@@ -126,6 +127,35 @@ class KeyManager:
         if rotation_days <= 0:
             logger.info("Key rotation disabled (rotation_interval_days <= 0).")
             return
+
+        # FIX #70: The original code checked rotation_interval_days but
+        # never compared against the last rotation timestamp.  The only
+        # logic was: if <= 0 → disabled, else → rotate unconditionally.
+        # This meant calling rotate_keys() ALWAYS triggered a rotation
+        # regardless of the interval setting — the config field was
+        # effectively just an on/off toggle, not an interval.
+        #
+        # We now determine when the last rotation occurred by inspecting
+        # the modification time (mtime) of the newest dilithium_priv key
+        # file.  If the key was created/rotated less than
+        # rotation_interval_days ago, we skip the rotation.  This makes
+        # the interval setting meaningful: keys are only rotated when
+        # they are actually due for renewal.
+        latest_key = self._find_latest_key("dilithium_priv", ".bin", required=False)
+        if latest_key and latest_key.is_file():
+            last_mtime = latest_key.stat().st_mtime
+            last_rotation_dt = datetime.datetime.utcfromtimestamp(last_mtime)
+            now_dt = datetime.datetime.utcnow()
+            elapsed = now_dt - last_rotation_dt
+            if elapsed.total_seconds() < rotation_days * 86400:
+                logger.info(
+                    "Key rotation not yet due: last rotated %s, interval=%d days, "
+                    "elapsed=%.1f days.",
+                    last_rotation_dt.isoformat() + "Z",
+                    rotation_days,
+                    elapsed.total_seconds() / 86400
+                )
+                return
 
         with KeyRotationLock(str(self.lockfile_path), self._must_fail()):
             backup_path = None

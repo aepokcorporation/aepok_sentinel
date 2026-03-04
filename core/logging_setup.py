@@ -91,27 +91,41 @@ class LockingRotatingFileHandler(RotatingFileHandler):
         # We also removed the audit_chain.append_event() call which had
         # the same module-level function bug as TODO #2, and could cause
         # reentrant logging during rollover.
+        #
+        # FIX #62: The post-rollover code opened a SECOND file handle to
+        # the new log file (via open(new_log_path, "a")) to write the
+        # LOG_ROTATED JSON event.  This created two independent file
+        # descriptors to the same file: self.stream (from the handler)
+        # and the separately opened 'f'.  Locking 'f' did NOT prevent
+        # concurrent writes through self.stream from other threads, so
+        # interleaved writes were still possible.  Additionally, if the
+        # audit_chain.append_event() call were still present, it would
+        # trigger logger.info() inside the chain, which would re-enter
+        # this handler's emit() while the handler is mid-rollover.
+        #
+        # The fix writes the LOG_ROTATED event directly through
+        # self.stream (which super().doRollover() already opened for the
+        # new file), eliminating the second file handle entirely.  This
+        # ensures only one fd exists and the handler's own lock in emit()
+        # serialises all access.
         old_stream = self.stream
         if old_stream:
             self._lock_file(old_stream)
         try:
             super().doRollover()
 
-            # After rotation, append one JSON line for "LOG_ROTATED" in the new log file
-            new_log_path = self.baseFilename
-            with open(new_log_path, mode="a", encoding="utf-8") as f:
-                self._lock_file(f)
-                try:
-                    event = {
-                        "timestamp": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-                        "subsystem": "logging_setup",
-                        "event_code": "LOG_ROTATED",
-                        "message": "Log rollover complete",
-                        "schema_version": 1
-                    }
-                    f.write(json.dumps(event) + "\n")
-                finally:
-                    self._unlock_file(f)
+            # Write LOG_ROTATED event directly to self.stream (the new
+            # log file) instead of opening a separate file handle.
+            if self.stream:
+                event = {
+                    "timestamp": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                    "subsystem": "logging_setup",
+                    "event_code": "LOG_ROTATED",
+                    "message": "Log rollover complete",
+                    "schema_version": 1
+                }
+                self.stream.write(json.dumps(event) + "\n")
+                self.stream.flush()
         finally:
             # Unlock the OLD stream (the one we actually locked), not
             # self.stream which now points to the new, never-locked file.
@@ -123,16 +137,38 @@ class LockingRotatingFileHandler(RotatingFileHandler):
 
     @staticmethod
     def _lock_file(file_obj):
+        # FIX #61: The original code used msvcrt.locking(fd, LK_LOCK, 1)
+        # which only locks a single byte at the current file position.
+        # If two processes write to different positions, the 1-byte lock
+        # provides no mutual exclusion — concurrent corruption is still
+        # possible.  On Unix, fcntl.flock() already locks the entire file
+        # (correct).  On Windows, we now use msvcrt.locking with the
+        # file's current size (minimum 1 byte) so the lock region covers
+        # the whole file.  We also seek to position 0 before locking so
+        # the locked region always starts at the beginning of the file,
+        # ensuring overlapping coverage regardless of where each process
+        # is writing.
         if platform.system() == "Windows":
-            # Lock one byte at current position
-            msvcrt.locking(file_obj.fileno(), msvcrt.LK_LOCK, 1)
+            import os
+            fd = file_obj.fileno()
+            file_obj.seek(0, 2)  # seek to end to get size
+            size = max(file_obj.tell(), 1)
+            file_obj.seek(0)     # lock from beginning
+            msvcrt.locking(fd, msvcrt.LK_LOCK, size)
         else:
             fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
 
     @staticmethod
     def _unlock_file(file_obj):
+        # FIX #61: Mirror the locking fix — unlock the same region we
+        # locked (from position 0 for the full file size) so Windows
+        # releases the correct byte range.
         if platform.system() == "Windows":
-            msvcrt.locking(file_obj.fileno(), msvcrt.LK_UNLCK, 1)
+            fd = file_obj.fileno()
+            file_obj.seek(0, 2)
+            size = max(file_obj.tell(), 1)
+            file_obj.seek(0)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, size)
         else:
             fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
 
