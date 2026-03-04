@@ -432,14 +432,18 @@ class SecurityDaemon:
                 "previous_hashes": self._previous_hashes
             }
             content_str = json.dumps(combined_data, indent=2)
-            
+
             tmp_hash_path = self.hash_store_path.with_suffix(".json.tmp")
             tmp_sig_path = self.hash_store_path.with_suffix(".json.sig.tmp")
             final_sig_path = self.hash_store_path.with_suffix(".json.sig")
-            
-            with open(self.hash_store_path, "w", encoding="utf-8") as f:
-                f.write(content_str)
 
+            # Write hash data to TEMP file first (atomic write pattern)
+            with open(tmp_hash_path, "w", encoding="utf-8") as f:
+                f.write(content_str)
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Sign the content and write signature to TEMP sig file
             with open(self.sign_priv_key_path, "rb") as kf:
                 dil_priv = kf.read()
             sig_bundle = sign_content_bundle(content_str.encode("utf-8"), self.config, dil_priv, None)
@@ -447,9 +451,12 @@ class SecurityDaemon:
             import json as j
             import base64
             sig_b64 = base64.b64encode(j.dumps(sig_bundle).encode("utf-8"))
-            with open(f"{self.hash_store_path}.sig", "wb") as sf:
+            with open(tmp_sig_path, "wb") as sf:
                 sf.write(sig_b64)
+                sf.flush()
+                os.fsync(sf.fileno())
 
+            # Atomically replace the final files from the temp files
             os.replace(tmp_hash_path, self.hash_store_path)
             os.replace(tmp_sig_path, final_sig_path)
 

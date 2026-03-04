@@ -102,16 +102,40 @@ def validate_sentinelrc(raw_dict: Dict[str, Any]) -> Dict[str, Any]:
     # 5. unknown_keys_allowed => check unknown keys if false
     unknown_keys_allowed = raw_dict.get("allow_unknown_keys", False)
 
-    # 6. Build the final dict with defaults
+    # 6. Build the final dict with defaults.
+    #    IMPORTANT: Start by copying the required fields (schema_version,
+    #    mode) into the output dict — they are NOT in DEFAULTS but
+    #    SentinelConfig.__init__ expects them via raw_dict["schema_version"]
+    #    and raw_dict["mode"].  Without this, every config load crashes with
+    #    KeyError.
     final_dict: Dict[str, Any] = {}
+    for req in REQUIRED_FIELDS:
+        final_dict[req] = raw_dict[req]
+
     for k, default_val in DEFAULTS.items():
         if k in raw_dict:
             final_dict[k] = raw_dict[k]
         else:
             final_dict[k] = default_val
 
+    # Also carry over any extra keys present in raw_dict that are not in
+    # DEFAULTS but are recognised by SentinelConfig (e.g. enforcement_mode,
+    # _signature_verified).  This ensures round-tripping through
+    # validate_sentinelrc does not silently drop them.
+    for k, v in raw_dict.items():
+        if k not in final_dict:
+            final_dict[k] = v
+
     if not unknown_keys_allowed:
-        known_keys = set(DEFAULTS.keys()).union(REQUIRED_FIELDS)
+        known_keys = set(DEFAULTS.keys()).union(REQUIRED_FIELDS).union({
+            "enforcement_mode", "_signature_verified",
+            "cloud_dilithium_secret", "cloud_kyber_secret",
+            "cloud_rsa_secret", "cloud_malware_url",
+            "autoban_enabled", "autoban_block_ttl_days",
+            "trusted_firewall_hashes", "allowed_tls_groups",
+            "anchor_export_path", "signer_id", "host_fingerprint",
+            "key_fingerprint",
+        })
         for k in raw_dict.keys():
             if k not in known_keys:
                 raise ValueError(f"Unknown config key '{k}' but allow_unknown_keys=false")

@@ -139,8 +139,10 @@ class SentinelController:
         self._disk_sanity_check()
 
         # (3) validate runtime structure
+        # validate_runtime_structure() takes no arguments — it uses the
+        # module-level SENTINEL_RUNTIME_BASE constant from directory_contract.
         try:
-            validate_runtime_structure(self.sentinel_runtime_base, strict_fail=self._must_fail())
+            validate_runtime_structure()
         except Exception as e:
             logger.error("Runtime structure validation failed: %s", e)
             if self._must_fail():
@@ -328,7 +330,7 @@ class SentinelController:
             if self._must_fail():
                 raise ControllerError(f"disk_sanity_check error in strict mode: {e}")
 
-        def _verify_trust_anchor_and_identity(self) -> None:
+    def _verify_trust_anchor_and_identity(self) -> None:
         """
         Verifies trust_anchor.json + identity.json (and their .sig) for:
           - vendor_dilithium_pub.pem hash
@@ -569,9 +571,13 @@ class SentinelController:
             pqc_pub_keys=pqc_pub,
             max_size_bytes=100 * 1024 * 1024,
             background_verification_interval=0,
-            anchor_config=anchor_config,
-            chain_dir=chain_path
+            anchor_config=anchor_config
         )
+        # Register the chain as the module-level singleton so that
+        # audit_chain.append_event() (the free function) works for other
+        # modules like config.py, logging_setup.py, etc.
+        from aepok_sentinel.core.audit_chain import set_global_chain
+        set_global_chain(self.audit_chain)
         # validate chain
         try:
             self.audit_chain.validate_chain()

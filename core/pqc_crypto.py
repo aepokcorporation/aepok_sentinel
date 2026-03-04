@@ -31,7 +31,14 @@ from cryptography.hazmat.primitives.asymmetric import (
 from cryptography.hazmat.primitives import serialization
 
 from aepok_sentinel.core.logging_setup import get_logger
-from aepok_sentinel.core.config import SentinelConfig
+
+# NOTE: SentinelConfig is NOT imported at module level to break a circular
+# import chain (config -> audit_chain -> pqc_crypto -> config).  Instead we
+# import it inside TYPE_CHECKING for static analysis only, and accept the
+# config parameter typed as Any at runtime.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from aepok_sentinel.core.config import SentinelConfig
 
 logger = get_logger("pqc_crypto")
 
@@ -372,12 +379,14 @@ def sign_content_bundle(
     # RSA sign fallback if allowed
     rsa_sign_b64 = ""
     fallback_allowed = False
-    if config.allow_classical_fallback and rsa_pub:
+    # Guard against config=None (e.g. when called from audit_chain signing).
+    # When config is None we skip classical fallback entirely — PQC-only.
+    if config is not None and config.allow_classical_fallback and rsa_priv:
         if config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"):
             logger.warning("Fallback explicitly disallowed: strict_transport or enforcement mode enforced.")
         else:
             fallback_allowed = True
-            
+
     if fallback_allowed:
         try:
             private_key = _load_rsa_private_key(rsa_priv)
@@ -391,9 +400,13 @@ def sign_content_bundle(
             logger.error("RSA sign fallback failed: %s", e)
             raise CryptoSignatureError(e)
 
-    # Identity binding
-    signer_id = config.raw_dict.get("signer_id", "unknown_signer")
-    host_fp = config.raw_dict.get("host_fingerprint", "unknown_host")
+    # Identity binding — config may be None when called from audit_chain
+    if config is not None:
+        signer_id = config.raw_dict.get("signer_id", "unknown_signer")
+        host_fp = config.raw_dict.get("host_fingerprint", "unknown_host")
+    else:
+        signer_id = "unknown_signer"
+        host_fp = "unknown_host"
     key_fp = hashlib.sha256(dil_priv).hexdigest()[:16] + "..."
 
     return {
@@ -439,12 +452,14 @@ def verify_content_signature(
     # RSA fallback if included and allowed
     rsa_sig_b64 = signatures.get("rsa", "")
     fallback_allowed = False
-    if config.allow_classical_fallback and rsa_pub:
+    # Guard against config=None — when called from audit_chain or controller
+    # without a config object, we skip classical RSA fallback (PQC-only).
+    if config is not None and config.allow_classical_fallback and rsa_pub:
         if config.strict_transport or config.enforcement_mode in ("STRICT", "HARDENED"):
             logger.warning("Fallback explicitly disallowed: strict_transport or enforcement mode enforced.")
         else:
             fallback_allowed = True
-            
+
     if fallback_allowed:
         try:
             rsa_sig = base64.b64decode(rsa_sig_b64)
@@ -460,8 +475,8 @@ def verify_content_signature(
                 from aepok_sentinel.core import audit_chain
                 audit_chain.append_event("SIGNATURE_RSA_USED", {
                     "context": "verify_content_signature",
-                    "enforcement_mode": config.enforcement_mode,
-                    "host_fingerprint": config.raw_dict.get("host_fingerprint", "unknown")
+                    "enforcement_mode": getattr(config, "enforcement_mode", "unknown") if config else "unknown",
+                    "host_fingerprint": (config.raw_dict.get("host_fingerprint", "unknown") if config else "unknown")
                 })
             except Exception:
                 logger.warning("Failed to emit SIGNATURE_RSA_USED event in verify_content_signature.")

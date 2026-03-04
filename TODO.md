@@ -3,6 +3,26 @@
 which imports SentinelConfig from config. This will deadlock or throw
 ImportError on startup depending on which module loads first.
 
+FIX APPLIED (pqc_crypto.py, config.py):
+  - Removed the top-level `from aepok_sentinel.core.config import SentinelConfig`
+    in pqc_crypto.py. This was the link that closed the circular chain
+    (config -> audit_chain -> pqc_crypto -> config).
+  - Replaced with a `TYPE_CHECKING`-guarded import so static type checkers
+    still see SentinelConfig, but at runtime the import never executes.
+    The functions that accept `config: SentinelConfig` now receive it as
+    a duck-typed parameter — they only access `.allow_classical_fallback`,
+    `.strict_transport`, `.enforcement_mode`, and `.raw_dict`, all of which
+    are present on any SentinelConfig instance passed in at call time.
+  - Also fixed the inconsistent import path in config.py:
+    `from utils.sentinelrc_schema import validate_sentinelrc` was changed to
+    `from aepok_sentinel.utils.sentinelrc_schema import validate_sentinelrc`
+    to match the package-qualified import convention used everywhere else
+    (this also fixes TODO item #18).
+  WHY: Breaking the cycle at pqc_crypto is the least disruptive choice
+  because SentinelConfig is only used as a type annotation for function
+  parameters in that module — it is never instantiated or subclassed there.
+  TYPE_CHECKING is the standard Python pattern for exactly this scenario.
+
 2. audit_chain.append_event is called as a module-level function
 throughout the codebase, but it doesn’t exist. config.py,
 logging_setup.py, pqc_tls.py, pqc_crypto.py, and malware_db.py all call
@@ -10,11 +30,46 @@ audit_chain.append_event(...) as though it’s a standalone function.
 It’s only an instance method on the AuditChain class. Every one of those
 calls is an AttributeError.
 
+FIX APPLIED (audit_chain.py, controller.py):
+  - Added a module-level singleton pattern to audit_chain.py:
+    * A private `_global_chain_instance` variable (initially None).
+    * `set_global_chain(instance)` to register the live AuditChain after
+      the controller creates it.
+    * `append_event(event, metadata)` as a free function that delegates
+      to the singleton, or silently no-ops if no instance exists yet.
+  - In controller.py `_init_audit_chain()`, after constructing the
+    AuditChain, we call `set_global_chain(self.audit_chain)` to register it.
+  - This means all existing callers (`config.py`, `logging_setup.py`, etc.)
+    that do `audit_chain.append_event(...)` now resolve to the real free
+    function, which forwards to the live instance.
+  WHY: The alternative was to refactor every caller to hold an AuditChain
+  reference, which would require threading the instance through dozens of
+  call sites. The singleton pattern matches the callers’ existing
+  assumption (module-level function) while keeping the AuditChain class
+  itself cleanly instantiated. Early calls before boot simply no-op,
+  which is safe because no audit events matter before the chain exists.
+
 3. pqc_crypto.py sign_content_bundle — RSA fallback condition
 references rsa_pub which doesn’t exist in scope. The function parameter
 is rsa_priv. The check if config.allow_classical_fallback and rsa_pub:
 will throw NameError every time signing is attempted with a non-None RSA
 key.
+
+FIX APPLIED (pqc_crypto.py, line ~375):
+  - Changed `if config.allow_classical_fallback and rsa_pub:` to
+    `if config is not None and config.allow_classical_fallback and rsa_priv:`
+  - Two problems were fixed in one change:
+    (a) `rsa_pub` was a NameError — the parameter is `rsa_priv`. This is
+        a signing function so the private key is the correct one to check.
+    (b) `config` can be None when called from audit_chain (see #4), so we
+        guard with `config is not None` first.
+  - Also fixed the identity binding block lower in the same function:
+    `config.raw_dict.get(...)` would crash if config is None. Added a
+    conditional that falls back to "unknown_signer" / "unknown_host" when
+    config is None.
+  WHY: This was a simple variable name typo (`rsa_pub` vs `rsa_priv`)
+  combined with a missing None guard. The function signs with the private
+  key, so checking for the private key’s presence is semantically correct.
 
 4. verify_content_signature is called with config=None from
 audit_chain.py. The function then accesses
@@ -22,11 +77,47 @@ config.allow_classical_fallback, config.strict_transport, and
 config.enforcement_mode. Any chain entry that contains an RSA signature
 field will crash with AttributeError on NoneType during validation.
 
+FIX APPLIED (pqc_crypto.py, verify_content_signature):
+  - Changed the RSA fallback guard from
+    `if config.allow_classical_fallback and rsa_pub:` to
+    `if config is not None and config.allow_classical_fallback and rsa_pub:`
+  - When config is None (as passed from audit_chain.py and controller.py),
+    we now skip the RSA fallback entirely — PQC-only verification.
+  - Also fixed the audit event emission inside the fallback block that
+    accessed `config.enforcement_mode` and `config.raw_dict` without a
+    None check. Now uses `getattr(config, ...) if config else "unknown"`.
+  WHY: audit_chain.py and controller.py legitimately pass config=None
+  because they verify chain entries using only PQC keys and have no
+  SentinelConfig at the call site. Skipping RSA fallback when config is
+  None is the correct semantic — PQC-only contexts should not attempt
+  classical fallback. This matches the security model: the chain is
+  signed with Dilithium only, so verification needs only Dilithium.
+
 5. controller.py — _verify_trust_anchor_and_identity is defined
 inside _disk_sanity_check due to indentation. It becomes a nested
 function, not a class method. The boot() method calls
 self._verify_trust_anchor_and_identity() which doesn’t exist on the
 class. The entire trust verification pipeline never executes.
+
+FIX APPLIED (controller.py, lines ~331–418):
+  - Dedented the entire `_verify_trust_anchor_and_identity` definition
+    from 8-space indent (nested inside `_disk_sanity_check`) to 4-space
+    indent (class method level on `SentinelController`).
+  - No logic changes were needed — the method body was correct, it was
+    simply defined at the wrong indentation level.
+  - Also fixed a related issue: `_init_audit_chain()` was passing
+    `chain_dir=chain_path` as a keyword argument to `AuditChain()`, but
+    `AuditChain.__init__` does not accept a `chain_dir` parameter (it
+    hardcodes `resolve_path("audit")`). Removed the stale kwarg (this
+    also addresses TODO item #13).
+  - Added `set_global_chain(self.audit_chain)` call after AuditChain
+    construction to register the singleton for the module-level
+    `append_event()` function (part of fix #2).
+  WHY: This was a pure indentation bug — Python’s significant whitespace
+  made `_verify_trust_anchor_and_identity` a local function invisible to
+  `self.` access. The trust verification pipeline (trust_anchor.json,
+  identity.json, vendor key hash binding) is critical to the security
+  model and was completely bypassed.
 
 6. controller.py calls
 validate_runtime_structure(self.sentinel_runtime_base,
@@ -34,11 +125,44 @@ strict_fail=self._must_fail()) but directory_contract.py’s
 validate_runtime_structure() accepts zero parameters. Immediate
 TypeError during boot.
 
+FIX APPLIED (controller.py, boot() step 3):
+  - Changed `validate_runtime_structure(self.sentinel_runtime_base,
+    strict_fail=self._must_fail())` to `validate_runtime_structure()`
+    with no arguments.
+  - `validate_runtime_structure()` in directory_contract.py uses the
+    module-level constant `SENTINEL_RUNTIME_BASE` and does not accept
+    parameters. The call in controller.py was passing arguments the
+    function cannot receive, causing an immediate `TypeError`.
+  WHY: The function’s design is intentionally zero-argument — the runtime
+  base path is a fixed constant (`/opsec/aepok_sentinel/runtime`) that
+  must not be overridden at call time. Passing `self.sentinel_runtime_base`
+  would have been a path mismatch risk anyway since the controller’s
+  value might differ from the contract’s constant. Removing the arguments
+  aligns the caller with the contract’s deliberate design.
+
 7. constants.py EventCode enum is missing at least eight codes
 referenced by other modules. CONTROLLER_BOOT, DAEMON_STARTED,
 DEVICE_PROVISIONED, KEY_GENERATION_FAILED, KEY_ROTATION_REVERTED,
 DISK_LIMIT_EXCEEDED, INSTALL_UPDATED, INSTALL_REJECTED. Every module
 that emits these crashes with AttributeError.
+
+FIX APPLIED (constants.py):
+  Added all eight missing enum members to EventCode, organized into
+  logical groups:
+    - Controller/daemon lifecycle: CONTROLLER_BOOT, DAEMON_STARTED,
+      DEVICE_PROVISIONED
+    - Key management failure/recovery: KEY_GENERATION_FAILED,
+      KEY_ROTATION_REVERTED
+    - Disk/resource: DISK_LIMIT_EXCEEDED
+    - Install lifecycle: INSTALL_UPDATED, INSTALL_REJECTED
+  Each value matches the string form used by callers (e.g.,
+  `EventCode.CONTROLLER_BOOT.value == "CONTROLLER_BOOT"`).
+  WHY: Every module that references these codes (controller.py,
+  security_daemon.py, key_manager.py, provision_device.py) would crash
+  with `AttributeError: CONTROLLER_BOOT is not a member of EventCode`.
+  The enum is the central registry for all audit/log event types, so any
+  event emitted anywhere in the system must have a corresponding member.
+  This also fixes TODO item #35 (DEVICE_PROVISIONED was missing).
 
 8. SentinelConfig.__init__ never sets tls_mode or
 cloud_keyvault_url as attributes. tls_mode is accessed by pqc_tls.py,
@@ -47,17 +171,81 @@ cloud_keyvault_url is accessed by status_printer.py and azure_client.py.
 Both are AttributeError on any code path that touches TLS or cloud
 functionality.
 
+FIX APPLIED (config.py, SentinelConfig.__init__):
+  - Added two new instance attributes before the existing "advanced fields"
+    block:
+      self.tls_mode: str = raw_dict.get("tls_mode", "hybrid")
+      self.cloud_keyvault_url: str = raw_dict.get("cloud_keyvault_url", "")
+  - Also expanded the `known_keys` set in `_check_for_unknown_keys` to
+    include: tls_mode, cloud_dilithium_secret, cloud_kyber_secret,
+    cloud_rsa_secret, cloud_malware_url, autoban_enabled,
+    autoban_block_ttl_days, trusted_firewall_hashes, allowed_tls_groups,
+    anchor_export_path, signer_id, host_fingerprint, key_fingerprint.
+    (This also addresses TODO item #34 — advanced config keys rejected
+    as unknown.)
+  WHY: Multiple modules access `config.tls_mode` and
+  `config.cloud_keyvault_url` as attributes. Without explicit assignment
+  in __init__, Python raises AttributeError. The default "hybrid" for
+  tls_mode matches the DEFAULTS in sentinelrc_schema.py. The default ""
+  for cloud_keyvault_url matches the disabled-by-default cloud behavior.
+  Expanding known_keys prevents ConfigError for legitimate advanced
+  configuration fields that were silently being rejected.
+
 9. sentinelrc_schema.py validate_sentinelrc returns a dict missing
 schema_version and mode. The function iterates only over DEFAULTS keys,
 and neither schema_version nor mode is in DEFAULTS. The returned dict is
 missing both required fields. SentinelConfig.__init__ immediately
 crashes with KeyError on raw_dict["schema_version"].
 
+FIX APPLIED (sentinelrc_schema.py, validate_sentinelrc):
+  - Before iterating DEFAULTS, the function now copies all REQUIRED_FIELDS
+    (schema_version, mode) from raw_dict into final_dict:
+      for req in REQUIRED_FIELDS:
+          final_dict[req] = raw_dict[req]
+  - After the DEFAULTS loop, added a pass-through for any extra keys in
+    raw_dict that are not already in final_dict (e.g. enforcement_mode,
+    _signature_verified). This ensures round-tripping through
+    validate_sentinelrc does not silently drop keys that SentinelConfig
+    needs.
+  - Also expanded the `known_keys` set in the unknown-keys check to
+    include enforcement_mode, _signature_verified, and all the advanced
+    keys (cloud_dilithium_secret, autoban_enabled, etc.) so they are not
+    rejected as unknown. This aligns with the config.py known_keys
+    expansion from fix #8.
+  WHY: The root cause was that REQUIRED_FIELDS and DEFAULTS were disjoint
+  sets, and the builder loop only iterated DEFAULTS. This made the entire
+  load_config() pathway broken end-to-end (also fixing TODO #33).
+  schema_version and mode are the two most critical fields — without
+  them SentinelConfig.__init__ cannot proceed past line 1.
+
 10. security_daemon.py _save_hash_store — writes to the final path,
 then attempts os.replace from temp paths that were never written to.
 tmp_hash_path and tmp_sig_path are defined but never opened for writing.
 The os.replace calls will throw FileNotFoundError on every save. File
 integrity tracking never persists to disk.
+
+FIX APPLIED (security_daemon.py, _save_hash_store):
+  - Restructured the write sequence to follow the correct atomic write
+    pattern:
+    1. Write hash JSON to tmp_hash_path (the .json.tmp file), with
+       flush + fsync for durability.
+    2. Sign the content and write the signature to tmp_sig_path (the
+       .json.sig.tmp file), also with flush + fsync.
+    3. Only then call os.replace(tmp_hash_path, self.hash_store_path) and
+       os.replace(tmp_sig_path, final_sig_path) to atomically swap the
+       temp files into the final locations.
+  - The original code wrote directly to self.hash_store_path (the final
+    path), then tried to os.replace from temp paths that were never
+    created. This caused FileNotFoundError on every save, meaning the
+    hash store never persisted to disk.
+  WHY: The atomic write pattern (write-to-temp, fsync, rename) is the
+  standard approach for crash-safe file updates. If the process crashes
+  mid-write, either the old file is intact (rename hasn't happened) or
+  the new file is complete (rename is atomic on POSIX). The original
+  code's direct write to the final path risked corruption on crash AND
+  the os.replace from nonexistent temps guaranteed failure on every call.
+  Without a persisted hash store, the daemon loses all file integrity
+  tracking across restarts.
 
 11. security_daemon.py — composite_nam typo. q_path =
 self.quarantine_dir / composite_nam throws NameError. The quarantine

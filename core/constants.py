@@ -38,6 +38,22 @@ class EventCode(Enum):
     TLS_FALLBACK = "TLS_FALLBACK"
     TLS_STRICT_FAIL = "TLS_STRICT_FAIL"
 
+    # Controller / daemon lifecycle events
+    CONTROLLER_BOOT = "CONTROLLER_BOOT"
+    DAEMON_STARTED = "DAEMON_STARTED"
+    DEVICE_PROVISIONED = "DEVICE_PROVISIONED"
+
+    # Key management failure/recovery events
+    KEY_GENERATION_FAILED = "KEY_GENERATION_FAILED"
+    KEY_ROTATION_REVERTED = "KEY_ROTATION_REVERTED"
+
+    # Disk / resource events
+    DISK_LIMIT_EXCEEDED = "DISK_LIMIT_EXCEEDED"
+
+    # Install lifecycle events
+    INSTALL_UPDATED = "INSTALL_UPDATED"
+    INSTALL_REJECTED = "INSTALL_REJECTED"
+
     # Intrusion / Autoban events
     SOURCE_BLOCKED = "SOURCE_BLOCKED"
     SOURCE_REJECTED = "SOURCE_REJECTED"
