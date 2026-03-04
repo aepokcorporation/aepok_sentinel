@@ -47,8 +47,15 @@ def gather_system_status(config: SentinelConfig, license_mgr: LicenseManager) ->
     else:
         lines.append("License State: UNKNOWN/INVALID")
 
-    if config.mode == "cloud" and config.cloud_keyvault_url:
-        lines.append(f"Cloud KeyVault URL: {config.cloud_keyvault_url}")
+    # FIX #77: config.cloud_keyvault_url was never set as an attribute on
+    # SentinelConfig — it only existed in raw_dict if the user configured it.
+    # This caused AttributeError whenever status was printed in cloud mode.
+    # The root fix is in config.py (cloud_keyvault_url now has a default ""),
+    # but we also use getattr here as a defensive measure in case the config
+    # was constructed without the full attribute setup (e.g. ephemeral configs).
+    cloud_url = getattr(config, "cloud_keyvault_url", "")
+    if config.mode == "cloud" and cloud_url:
+        lines.append(f"Cloud KeyVault URL: {cloud_url}")
 
     # Additional details
     lines.append(f"allow_delete: {config.allow_delete}")

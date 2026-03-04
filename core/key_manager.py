@@ -248,8 +248,18 @@ class KeyManager:
 
     def _find_latest_key(self, prefix: str, ext: str, required: bool = True) -> Optional[Path]:
         """
-        Looks for files named like <prefix>_<timestamp>.ext in keys_dir. 
+        Looks for files named like <prefix>_<timestamp>.ext in keys_dir.
         Returns the newest by mtime or None if none found.
+
+        FIX #71: Also falls back to vendor-prefixed keys (e.g.
+        vendor_dilithium_priv.bin) when no rotated keys are found.
+        Provisioning creates keys named vendor_<prefix><ext>, but rotation
+        creates <prefix>_<timestamp><ext>.  Before the first rotation,
+        _find_latest_key("dilithium_priv", ".bin") would find nothing
+        because the vendor key starts with "vendor_", not "dilithium_priv".
+        The vendor-prefix fallback ensures the initial provisioned keys are
+        discoverable by fetch_current_keys() and rotate_keys() even before
+        any rotation has occurred.
         """
         if not self.keys_dir.is_dir():
             if required and self._must_fail():
@@ -260,6 +270,18 @@ class KeyManager:
         for item in self.keys_dir.iterdir():
             if item.is_file() and item.name.startswith(prefix) and item.name.endswith(ext):
                 matches.append(item)
+
+        # FIX #71: If no rotated keys found, fall back to vendor-prefixed keys.
+        # Provisioning names keys "vendor_dilithium_priv.bin" but rotation
+        # names them "dilithium_priv_YYYYMMDD_HHMMSS.bin".  Without this
+        # fallback, the system cannot find its own keys between provisioning
+        # and the first rotation.
+        if not matches:
+            vendor_prefix = f"vendor_{prefix}"
+            for item in self.keys_dir.iterdir():
+                if item.is_file() and item.name.startswith(vendor_prefix) and item.name.endswith(ext):
+                    matches.append(item)
+
         if not matches:
             if required and self._must_fail():
                 raise KeyManagerError(f"No {prefix} file found in strict mode.")

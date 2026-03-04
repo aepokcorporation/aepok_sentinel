@@ -83,43 +83,19 @@ class LicenseManager:
             if not os.path.isdir(sentinel_runtime_base):
                 raise RuntimeError(f"Sentinel runtime base does not exist: {sentinel_runtime_base}")
 
-        # 1) Determine default license path from directory_contract
-        self.default_license_path = resolve_path("license", "license.key")
-
-        # If the config has an override license_path, we validate it remains under the runtime directory.
-        # Then we accept it. Otherwise, we keep the default.
-        if "license_path" in config.raw_dict:
-            candidate_str = config.raw_dict["license_path"]
-            # FIX #32: resolve_path(*candidate.parts) was called with the
-            # full absolute-path parts (e.g. ('/', 'etc', 'sentinel', ...)),
-            # which prepended every component under SENTINEL_RUNTIME_BASE,
-            # producing a nonsensical path like /opsec/.../runtime///etc/...
-            # that could never match anything real.
-            #
-            # Instead we resolve the user-supplied path directly and compare
-            # it against the runtime base using Path parentage (not fragile
-            # string startswith).  If it falls inside the runtime tree we
-            # canonicalise it through resolve_path(); otherwise we accept the
-            # external path as-is after a runtime-base guard check.
-            candidate = Path(candidate_str).resolve()
-            from aepok_sentinel.core.directory_contract import SENTINEL_RUNTIME_BASE
-            runtime_base = SENTINEL_RUNTIME_BASE.resolve()
-            try:
-                candidate.relative_to(runtime_base)
-                # Path is inside the runtime tree → canonicalise via contract
-                resolved = resolve_path("license", "license.key")
-            except ValueError:
-                # Path is outside the runtime tree
-                resolved = candidate
-                if sentinel_runtime_base:
-                    rp = Path(sentinel_runtime_base).resolve()
-                    try:
-                        resolved.relative_to(rp)
-                    except ValueError:
-                        raise LicenseError(f"Rejected unsafe override path outside runtime: {resolved}")
-            self.license_path = resolved
-        else:
-            self.license_path = self.default_license_path
+        # FIX #72: SentinelConfig.__init__ already computes a validated
+        # license_path via _apply_license_path_contract(), which resolves
+        # paths inside the runtime tree to the contract location and
+        # accepts external paths as-is.  LicenseManager previously
+        # duplicated all that logic here, producing a second license_path
+        # that could disagree with config.license_path.  Code that read
+        # config.license_path and code that read license_mgr.license_path
+        # could silently diverge.
+        #
+        # Now we use config.license_path as the single source of truth.
+        # The validation and runtime-base guard that was here has been
+        # consolidated into SentinelConfig._apply_license_path_contract().
+        self.license_path = Path(config.license_path)
 
         # 2) Identity path (host_fingerprint). No auto-creation.
         self.identity_path = resolve_path("config", "identity.json")
