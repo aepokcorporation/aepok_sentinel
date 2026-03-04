@@ -474,12 +474,42 @@ included "signature": "" in the JSON. The verify path excludes it.
 The data bytes won’t match. Every signed chain entry will fail signature
 verification on re-validation.​​​​​​​​​​​​​​​​
 
+FIX APPLIED (audit_chain.py, append_event method):
+  - Removed the premature `record["signature"] = ""` assignment that was
+    set BEFORE computing the signature.  The signature is now computed
+    over the record without any "signature" key present, then the
+    signature field is added afterward.  An `else` branch sets
+    `record["signature"] = ""` only when no Dilithium key is available.
+  WHY: validate_chain pops the "signature" key from the record before
+  re-serializing to verify.  The signing path must produce the same JSON
+  that the verify path will reconstruct.  Including `"signature": ""`
+  in the signed JSON but excluding it during verification made the
+  data_bytes permanently diverge — every signed entry would fail
+  verification.  This is now consistent: both paths serialize the
+  record without the signature field.
+
 22. audit_chain.py _build_in_memory_state is called inside
 append_event while holding the file lock on chain_file. But
 _build_in_memory_state opens chain_file again for reading with a
 separate file handle. On some platforms (Windows especially, but also
 possible on Linux depending on lock type), this either deadlocks or
 reads stale data. On every single append.
+
+FIX APPLIED (audit_chain.py, _build_in_memory_state and append_event):
+  - Added an optional `chain_f` parameter to `_build_in_memory_state()`.
+    When a caller already holds the file lock (like append_event), it
+    passes the open file handle directly.  The method seeks to position 0
+    and reads from the existing handle instead of opening a new one.
+  - Updated the call in `append_event` to pass `chain_f` to
+    `_build_in_memory_state(chain_f)`.
+  - A fallback `else` branch still opens the file for callers that do
+    not provide a handle (e.g. `__init__` startup rebuild).
+  WHY: Opening a second file handle to the same file while holding an
+  exclusive `fcntl.flock` or `msvcrt.locking` lock is undefined behavior
+  on many platforms.  On Windows it deadlocks; on some Linux
+  configurations it reads stale/cached data.  Passing the already-open
+  handle eliminates the second open entirely, making the I/O safe and
+  portable.
 
 23. audit_chain.py _rollover_chain calls
 self.append_event("CHAIN_REPLAY_SUSPECTED", ...) and
@@ -491,6 +521,21 @@ append_event call tries to write to the new empty chain but
 _build_in_memory_state will find zero entries, potentially resetting
 all Merkle state mid-operation.
 
+FIX APPLIED (audit_chain.py, __init__, append_event, _rollover_chain):
+  - Added an `_in_rollover` boolean flag, initialized to False.
+  - `_rollover_chain` sets `_in_rollover = True` before starting and
+    resets it in a `finally` block.
+  - `append_event` checks `_in_rollover` at entry; if True, it logs a
+    warning and returns immediately without acquiring locks or
+    touching Merkle state.
+  WHY: During rollover the chain file is renamed and recreated empty.
+  Any recursive `append_event` call (triggered by _submit_to_external_anchor
+  error paths like "ANCHOR_EXPORT_FAILED") would try to acquire the lock
+  again, rebuild Merkle state from the empty chain (resetting leaf_hashes
+  and tree_levels to []), and corrupt the rollover process.  The guard
+  flag prevents this re-entrant corruption while still logging the event
+  as a warning for observability.
+
 24. audit_chain.py _check_boot_hash compares
 _get_current_merkle_root() against stored root, but
 _get_current_merkle_root() depends on tree_levels which is only
@@ -499,6 +544,21 @@ called before the first _build_in_memory_state, tree_levels is empty,
 the function returns "EMPTY_CHAIN", and the check passes even if the
 chain file has hundreds of entries. The replay detection is bypassed on
 every cold start until the first event is appended.
+
+FIX APPLIED (audit_chain.py, __init__):
+  - Added a call to `_build_in_memory_state()` in `__init__`, after
+    `boot_hash` is loaded but before the background verification thread
+    starts.  Wrapped in a try/except for ChainTamperDetectedError so
+    a corrupt chain at startup doesn't crash initialization entirely.
+  WHY: `_check_boot_hash` (called at the top of every `append_event`)
+  relies on `_get_current_merkle_root()`, which reads from `tree_levels`.
+  Before this fix, `tree_levels` was empty until the first `append_event`
+  ran `_build_in_memory_state` internally, meaning `_get_current_merkle_root()`
+  always returned "EMPTY_CHAIN" on cold start.  Since "EMPTY_CHAIN" is
+  in the pass-list, replay detection was completely bypassed — an attacker
+  could swap in a different chain file and the system would accept it
+  until an event was appended.  Building state at init ensures the root
+  reflects the actual chain contents from the first boot-hash check.
 
 25. audit_chain.py export_chain calls
 self.append_event("EXPORT_CHAIN", ...) after writing the export. But
@@ -509,6 +569,22 @@ threshold, this append could trigger rollover, which renames the chain
 file that was just exported, making the export point to a chain state
 that no longer exists under that filename.
 
+FIX APPLIED (audit_chain.py, export_chain):
+  - Moved `self.append_event("EXPORT_CHAIN", ...)` to BEFORE the chain
+    file is read and exported.  The export snapshot is now taken after
+    the event is already part of the chain, so the export includes its
+    own export event and is not immediately stale.
+  - The `provenance_sha512` field was removed from the pre-export event
+    metadata (since the hash isn't known until after the export is
+    written); the export path and signature path are still recorded.
+  WHY: Appending after the snapshot created two problems: (1) the export
+  was immediately missing the event that documented it, and (2) if the
+  chain was at the rollover threshold, the append could trigger rollover
+  which renames the chain file — invalidating the export that was just
+  written.  By appending first, both problems are eliminated: the export
+  is self-documenting and any rollover triggered by the append happens
+  before the snapshot, not after.
+
 26. audit_chain.py timestamp monotonicity validation will reject
 legitimate events. _utc_iso_now() truncates microseconds with
 replace(microsecond=0). If two events are appended within the same
@@ -516,6 +592,23 @@ second, they get identical timestamps. The validator checks ts_dt <=
 last_ts (strict less-than-or-equal), so equal timestamps fail
 validation. Under any load, the chain self-corrupts from the validator’s
 perspective.
+
+FIX APPLIED (audit_chain.py, _utc_iso_now and validate_chain):
+  - In `_utc_iso_now()`: Removed the `.replace(microsecond=0)` truncation.
+    Timestamps now retain full microsecond precision (e.g.
+    "2026-03-04T12:00:00.123456Z" instead of "2026-03-04T12:00:00Z").
+  - In `validate_chain()`: Changed the monotonicity check from `<=`
+    (less-than-or-equal) to `<` (strict less-than), so equal timestamps
+    are accepted as valid.
+  WHY: Two fixes working together.  The truncation forced all events
+  within the same second to share an identical timestamp.  The `<=`
+  check then rejected the second event as a monotonicity violation,
+  causing the chain to self-corrupt under any non-trivial throughput.
+  Preserving microseconds dramatically reduces the chance of collisions,
+  and relaxing to `<` ensures that even on systems with coarse clock
+  resolution, legitimate same-tick events are not flagged as tampering.
+  Only genuinely backwards timestamps (indicating clock manipulation or
+  replay) are now rejected.
 
 27. license.py _verify_license_signature decodes the signature field
 from the license as base64 JSON, but issue_offline_license.py stores the
@@ -527,6 +620,21 @@ parses JSON, and gets signature as a dict — then tries to
 base64.b64decode(sig_b64) on that dict. TypeError — you can’t base64
 decode a dict.
 
+FIX APPLIED (license.py, _verify_license_signature):
+  - The signature field is now checked with `isinstance(sig_val, dict)`.
+    If it's already a dict (the normal case from issue_offline_license.py),
+    it's used directly as `sig_dict` — no base64 decoding needed.
+  - A fallback branch handles the case where `sig_val` is a string,
+    decoding it as base64 JSON for forward-compatibility with any
+    future issuers that might encode the signature.
+  WHY: issue_offline_license.py assigns the raw sig_dict directly into
+  the license object (`license_obj["signature"] = sig_dict`), then
+  base64-encodes the entire license as the .key file.  When license.py
+  decodes the outer base64 and parses the JSON, the "signature" field
+  arrives as a Python dict — calling `base64.b64decode()` on a dict
+  raises TypeError.  By type-checking first, we handle the actual
+  data format correctly while remaining robust to alternative formats.
+
 28. license.py _verify_license_signature builds data_bytes from
 json.dumps(lic_copy, sort_keys=True). But issue_offline_license.py signs
 json.dumps(license_obj, separators=(",", ":")) — compact JSON with
@@ -534,6 +642,20 @@ no spaces and no sort_keys. The serialization formats differ. Even if
 the signature type issue in #27 were fixed, the signed data bytes would
 never match the verification data bytes. Every license would fail
 signature verification.
+
+FIX APPLIED (license.py, _verify_license_signature):
+  - Changed `json.dumps(lic_copy, sort_keys=True)` to
+    `json.dumps(lic_copy, separators=(",", ":"))` to match the compact
+    serialization format used by issue_offline_license.py when signing.
+  WHY: issue_offline_license.py signs with
+  `json.dumps(license_obj, separators=(",", ":"))` — compact JSON with
+  no whitespace and no key sorting.  The verification side was using
+  `json.dumps(lic_copy, sort_keys=True)` with default separators
+  (which include spaces: `", "` and `": "`).  These two formats produce
+  different byte sequences for the same data, so the cryptographic
+  signature verification would always fail because the data_bytes
+  being verified never matched the data_bytes that were signed.
+  Both sides now use the same compact format.
 
 29. license.py _load_install_state does import base64, json as j
 inside the method body, shadowing the module-level json import. This
@@ -545,12 +667,50 @@ over — but since they’re separate scopes, it technically works.
 However it suggests copy-paste development patterns that increase defect
 risk.
 
+FIX APPLIED (license.py, _load_install_state and _save_install_state;
+             audit_chain.py, _submit_to_external_anchor):
+  - Removed `import base64, json as j` from inside `_load_install_state()`.
+    Replaced `j.loads(...)` with `json.loads(...)` using the module-level
+    import.
+  - Removed `import json as j, base64` from inside `_save_install_state()`.
+    Replaced `j.dumps(...)` with `json.dumps(...)`.
+  - Also removed a similar `import base64, json as j` from
+    `audit_chain.py`'s `_submit_to_external_anchor()` method.
+  WHY: Both `base64` and `json` are already imported at the top of each
+  file.  The local re-imports with an alias (`json as j`) shadowed the
+  module-level name, creating a maintenance trap: any code added later
+  that referenced `j` outside these methods would fail with NameError,
+  and the inconsistent naming made the codebase harder to audit.  While
+  technically functional (each local scope is independent), this pattern
+  indicates copy-paste development and increases defect risk.  Using the
+  already-imported names is cleaner, consistent, and eliminates the
+  shadowing hazard entirely.
+
 30. license.py _check_hardware_binding reads identity.json and looks
 for "fingerprint" field, but provision_device.py
 generate_host_identity writes the field as "host_fingerprint". The
 field name mismatch means hardware binding always fails — local_fprint
 is always empty string, bound_val == local_fprint is always false for
 any actual bound license. Hardware binding is non-functional.
+
+FIX APPLIED (license.py, _check_hardware_binding and _get_local_host_fp):
+  - Changed `ident_data.get("fingerprint", "")` to
+    `ident_data.get("host_fingerprint", "")` in `_check_hardware_binding()`.
+  - Changed `obj.get("fingerprint", "unknown")` to
+    `obj.get("host_fingerprint", "unknown")` in `_get_local_host_fp()`.
+  WHY: provision_device.py's `generate_host_identity()` writes the
+  field as `"host_fingerprint"` in identity.json.  Both license.py
+  methods were looking for `"fingerprint"` — a key that doesn't exist
+  in the file.  This meant `local_fprint` was always empty string (or
+  "unknown"), causing two cascading failures:
+    (a) Hardware binding always failed — any legitimately bound license
+        was rejected because the local fingerprint never matched.
+    (b) Install count tracking always recorded the host as "unknown",
+        so every boot looked like a new installation.  The install
+        counter incremented on every startup until hitting max_installs,
+        at which point the license was permanently rejected.
+  Aligning the field name with what provision_device.py actually writes
+  restores both hardware binding and install tracking to functional state.
 
 31. license.py _get_local_host_fp also reads "fingerprint" from
 identity.json. Same field name mismatch as #30. Install count tracking
