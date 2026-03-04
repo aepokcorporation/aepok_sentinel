@@ -550,9 +550,34 @@ class SentinelController:
 
         from aepok_sentinel.core.audit_chain import AuditChain
         local_keys = self.key_manager.fetch_current_keys()
+
+        # FIX #67: If fetch_current_keys() fails in permissive mode it
+        # returns an empty dict.  local_keys.get("dilithium_priv") then
+        # evaluates to None, and the AuditChain is initialised with
+        # None as the Dilithium private key.  Every subsequent
+        # sign_content_bundle call passes None to
+        # oqs.Signature("Dilithium2", None), which crashes.
+        #
+        # We now check whether the critical dilithium key is actually
+        # present.  If it is None or empty, we refuse to create the
+        # chain in strict mode (raising ControllerError) or skip chain
+        # creation in permissive mode so that downstream code sees
+        # self.audit_chain = None and can degrade gracefully instead of
+        # crashing mid-sign.
+        dil_priv = local_keys.get("dilithium_priv")
+        rsa_priv = local_keys.get("rsa_priv")
+        if not dil_priv:
+            msg = "Dilithium private key is None/empty — cannot initialise audit chain signing."
+            logger.error(msg)
+            if self._must_fail():
+                raise ControllerError(msg)
+            logger.warning("Skipping audit chain init (no signing key) in permissive mode.")
+            self.audit_chain = None
+            return
+
         pqc_priv = {
-            "dilithium": local_keys.get("dilithium_priv"),
-            "rsa": local_keys.get("rsa_priv")
+            "dilithium": dil_priv,
+            "rsa": rsa_priv
         }
         pqc_pub = {
             "dilithium": None,
@@ -591,6 +616,26 @@ class SentinelController:
         """
         Instantiate the AutobanManager to block suspicious sources. If fails => degrade or raise in strict.
         """
+        # FIX #68: AutobanManager.__init__ accepts (config, license_mgr,
+        # audit_chain, blocklist_file, sign_priv_key_path).  The last
+        # two have defaults that may point to non-existent paths.  More
+        # critically, if self.audit_chain is None (e.g. from the #67
+        # pathway where key fetch failed in permissive mode), autoban
+        # still initialises successfully — but every internal
+        # _append_chain_event call does
+        #     self.audit_chain.append_event(...)
+        # on None, causing an AttributeError at runtime.
+        #
+        # We now explicitly warn when audit_chain is None so the
+        # operator knows autoban events will not be recorded.  We still
+        # allow autoban to initialise (blocking bad IPs is valuable even
+        # without audit), but pass None safely — AutobanManager must
+        # guard its own chain calls (or we rely on its own None checks).
+        if self.audit_chain is None:
+            logger.warning(
+                "Autoban: audit_chain is None — autoban events will not "
+                "be recorded in the audit chain."
+            )
         from aepok_sentinel.core.autoban import AutobanManager
         try:
             self.autoban_mgr = AutobanManager(self.config, self.license_mgr, self.audit_chain)
@@ -651,7 +696,31 @@ class SentinelController:
             except Exception as e:
                 logger.error("Failed to append chain event %s => %s", event.value, e)
         else:
-            logger.info("No audit chain => event %s with metadata %s", event.value, metadata)
+            # FIX #69: The original code used logger.info() here, which
+            # is easy to miss among normal log output.  When the audit
+            # chain is None, ALL events are silently dropped — including
+            # CONTROLLER_BOOT, the single most important audit trail
+            # entry.  If the chain init failed and self.audit_chain is
+            # None, the boot event disappears without any error or
+            # warning, leaving a gap in the audit record.
+            #
+            # We now emit a WARNING (not info) that clearly identifies
+            # which event was dropped and flags the missing chain.  For
+            # the critical CONTROLLER_BOOT event specifically, we
+            # escalate to ERROR level so it stands out in logs and
+            # alerts operators that the audit trail has a gap from the
+            # very start of the session.
+            if event == EventCode.CONTROLLER_BOOT:
+                logger.error(
+                    "AUDIT GAP: %s event DROPPED — audit chain is None. "
+                    "The boot audit trail entry is missing. metadata=%s",
+                    event.value, metadata
+                )
+            else:
+                logger.warning(
+                    "No audit chain => event %s DROPPED. metadata=%s",
+                    event.value, metadata
+                )
 
     def _must_fail(self) -> bool:
         """

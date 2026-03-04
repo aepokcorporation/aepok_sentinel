@@ -6,6 +6,7 @@ A minimal Azure Key Vault client supporting:
  - PQC-hybrid TLS usage if strict_transport or tls_mode != "classical"
  - Fallback to default TLS if PQC creation fails and strict_transport is False
  - No creation of or reference to Sentinel runtime directories.
+ - Azure Managed Identity / DefaultAzureCredential for authentication.
 """
 
 import requests
@@ -15,6 +16,11 @@ from aepok_sentinel.core.logging_setup import get_logger
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, is_watch_only
 from aepok_sentinel.core.pqc_tls import create_pqc_ssl_context, PQCTlsError
+
+# FIX #65: Azure Key Vault API version constant.  All REST calls to
+# Azure Key Vault require an api-version query parameter; without it
+# Azure returns 400 Bad Request.
+AZURE_API_VERSION = "7.4"
 
 logger = get_logger("azure_client")
 
@@ -55,14 +61,34 @@ class AzureClient:
         self.base_url = self.config.cloud_keyvault_url.rstrip("/")
         self._session = self._build_requests_session()
 
+        # FIX #65: The original code never set any authentication
+        # headers on HTTP requests.  Azure Key Vault requires a Bearer
+        # token for every API call — without one, every request returns
+        # 401 Unauthorized, making the entire Azure integration
+        # non-functional.
+        #
+        # We now acquire a token via azure.identity.DefaultAzureCredential
+        # which supports managed identity (VMs, App Service, AKS),
+        # environment variables, Azure CLI, and other credential sources.
+        # The token is scoped to the Key Vault resource
+        # (https://vault.azure.net/.default) and set as the
+        # Authorization header on the session so all subsequent calls
+        # are authenticated.
+        self._authenticate_session()
+
     def get_secret(self, secret_name: str) -> str:
         """
         Retrieves a secret from Azure Key Vault.
         This is permitted even if watch-only, since it's a read operation.
         """
+        # FIX #66: Added api-version query parameter.  The original URL
+        # was just {base_url}/secrets/{name} with no API version.  Azure
+        # Key Vault requires ?api-version=7.x on every REST call;
+        # without it, the service returns 400 Bad Request or a redirect.
         url = f"{self.base_url}/secrets/{secret_name}"
+        params = {"api-version": AZURE_API_VERSION}
         try:
-            resp = self._session.get(url, timeout=10)
+            resp = self._session.get(url, params=params, timeout=10)
             if resp.status_code != 200:
                 raise AzureClientError(f"GET {url} returned {resp.status_code}: {resp.text}")
             data = resp.json()
@@ -78,9 +104,11 @@ class AzureClient:
         if is_watch_only(self.license_mgr):
             raise AzureClientError("Watch-only mode => cannot set secrets.")
 
+        # FIX #66: Added api-version query parameter (see get_secret).
         url = f"{self.base_url}/secrets/{secret_name}"
+        params = {"api-version": AZURE_API_VERSION}
         try:
-            resp = self._session.put(url, json={"value": value}, timeout=10)
+            resp = self._session.put(url, json={"value": value}, params=params, timeout=10)
             if resp.status_code not in (200, 201):
                 raise AzureClientError(f"PUT {url} returned {resp.status_code}: {resp.text}")
             logger.info("Set secret '%s' in Azure Key Vault. status=%d", secret_name, resp.status_code)
@@ -97,9 +125,11 @@ class AzureClient:
         if not self.config.allow_delete:
             raise AzureClientError("Deletion not allowed (allow_delete=false).")
 
+        # FIX #66: Added api-version query parameter (see get_secret).
         url = f"{self.base_url}/secrets/{secret_name}"
+        params = {"api-version": AZURE_API_VERSION}
         try:
-            resp = self._session.delete(url, timeout=10)
+            resp = self._session.delete(url, params=params, timeout=10)
             if resp.status_code != 200:
                 raise AzureClientError(f"DELETE {url} returned {resp.status_code}: {resp.text}")
             logger.info("Deleted secret '%s' in Azure Key Vault.", secret_name)
@@ -157,3 +187,36 @@ class AzureClient:
         )
         sess.mount("https://", adapter)
         return sess
+
+    def _authenticate_session(self) -> None:
+        """
+        FIX #65: Acquire a Bearer token for Azure Key Vault and set it
+        as the default Authorization header on the requests session.
+
+        Uses azure.identity.DefaultAzureCredential which transparently
+        supports managed identity (Azure VMs, App Service, AKS),
+        environment-variable credentials, Azure CLI auth, and more.
+        The token is scoped to https://vault.azure.net/.default, which
+        is the resource scope required by Azure Key Vault REST API.
+
+        If the azure-identity package is not installed or token
+        acquisition fails, raises AzureClientError so the caller knows
+        the client is non-functional (every call would 401 anyway).
+        """
+        try:
+            from azure.identity import DefaultAzureCredential
+        except ImportError:
+            raise AzureClientError(
+                "azure-identity package is not installed. "
+                "Install it with: pip install azure-identity"
+            )
+
+        try:
+            credential = DefaultAzureCredential()
+            token = credential.get_token("https://vault.azure.net/.default")
+            self._session.headers["Authorization"] = f"Bearer {token.token}"
+            logger.info("AzureClient: Authenticated via DefaultAzureCredential.")
+        except Exception as e:
+            raise AzureClientError(
+                f"Failed to acquire Azure Key Vault access token: {e}"
+            )
