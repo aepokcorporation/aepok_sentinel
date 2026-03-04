@@ -12,7 +12,6 @@ Verifies:
 
 import unittest
 from unittest.mock import patch, MagicMock
-import ssl
 
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.utils.pqc_tls_verify import (
@@ -21,7 +20,6 @@ from aepok_sentinel.utils.pqc_tls_verify import (
     verify_cert_fingerprint,
     check_session_resumption,
     log_tls_verification_event,
-    PQCVerifyError
 )
 
 

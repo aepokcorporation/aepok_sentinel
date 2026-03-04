@@ -8,7 +8,7 @@ Validates:
 """
 
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 import io
 
 from aepok_sentinel.core.config import SentinelConfig

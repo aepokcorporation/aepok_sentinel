@@ -19,7 +19,6 @@ import base64
 from unittest.mock import patch, MagicMock
 
 from aepok_sentinel.core.controller import SentinelController, ControllerError
-from aepok_sentinel.core.constants import EventCode
 
 
 class TestController(unittest.TestCase):
@@ -86,7 +85,10 @@ class TestController(unittest.TestCase):
     @patch("aepok_sentinel.core.controller.shutil.disk_usage")
     @patch("aepok_sentinel.core.controller.LicenseManager.load_license")
     @patch("aepok_sentinel.core.controller.SentinelController._verify_file_hash")
-    @patch("aepok_sentinel.core.controller.SentinelController._load_sentinelrc_pub_key", return_value=b"SENTINELRC_PUB_DATA")
+    @patch(
+        "aepok_sentinel.core.controller.SentinelController._load_sentinelrc_pub_key",
+        return_value=b"SENTINELRC_PUB_DATA"
+    )
     @patch("aepok_sentinel.core.controller.get_logger")
     def test_strict_boot_success(
         self, mock_logger, mock_pub, mock_hash, mock_lic, mock_disk, mock_verify
@@ -127,9 +129,18 @@ class TestController(unittest.TestCase):
         with self.assertRaises(ControllerError):
             ctrl.boot()
 
-    @patch("aepok_sentinel.core.controller.verify_content_signature", return_value=True)
-    @patch("aepok_sentinel.core.controller.shutil.disk_usage", return_value=MagicMock(free=999999999))
-    @patch("aepok_sentinel.core.controller.SentinelController._verify_file_hash", side_effect=ControllerError("hash mismatch"))
+    @patch(
+        "aepok_sentinel.core.controller.verify_content_signature",
+        return_value=True
+    )
+    @patch(
+        "aepok_sentinel.core.controller.shutil.disk_usage",
+        return_value=MagicMock(free=999999999)
+    )
+    @patch(
+        "aepok_sentinel.core.controller.SentinelController._verify_file_hash",
+        side_effect=ControllerError("hash mismatch")
+    )
     def test_trust_anchor_hash_fail(self, mock_hash, mock_disk, mock_verify):
         ctrl = SentinelController(
             config_path=self.config_path,

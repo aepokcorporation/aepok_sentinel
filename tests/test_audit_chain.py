@@ -16,8 +16,7 @@ import json
 import shutil
 import unittest
 import tempfile
-import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from pathlib import Path
 
 from aepok_sentinel.core.audit_chain import (

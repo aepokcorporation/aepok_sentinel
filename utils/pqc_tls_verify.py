@@ -21,7 +21,6 @@ Utilities for verifying PQC/hybrid TLS sessions:
 import ssl
 import hashlib
 import logging
-from typing import Optional
 
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.pqc_tls import _get_negotiated_group
@@ -58,10 +57,10 @@ def verify_negotiated_pqc(tls_sock: ssl.SSLSocket, config: SentinelConfig) -> bo
 
     mode = config.tls_mode.lower()
     if mode == "classical":
-       if config.strict_transport:
-           logger.error("Strict transport disallows classical TLS. Rejecting session.")
-           return False
-       return True
+        if config.strict_transport:
+            logger.error("Strict transport disallows classical TLS. Rejecting session.")
+            return False
+        return True
 
     if mode == "pqc-only":
         if "kyber" not in group_name.lower():

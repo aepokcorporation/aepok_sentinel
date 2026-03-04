@@ -24,7 +24,6 @@ import os
 import json
 import hashlib
 import base64
-import logging
 import time
 import threading
 import platform
@@ -383,7 +382,8 @@ class AuditChain:
                     if not ok:
                         return self._validation_fail(raise_on_fail, f"Line {line_num}: signature verify failed")
                 except Exception as e:
-                    return self._validation_fail(raise_on_fail, f"Line {line_num}: signature parse or verify error => {e}")
+                    return self._validation_fail(
+                        raise_on_fail, f"Line {line_num}: signature parse or verify error => {e}")
 
             # Rebuild merkle
             self._insert_leaf_during_validation(entry_h)
@@ -413,7 +413,6 @@ class AuditChain:
         # chain, rebuild Merkle state to zero entries, and corrupt the
         # in-memory tree mid-operation.
         self._in_rollover = True
-        deferred_events: List[tuple] = []
 
         try:
             valid = self.validate_chain(raise_on_fail=False)
@@ -489,10 +488,10 @@ class AuditChain:
         with open(output_path, "w", encoding="utf-8") as out_f:
             out_f.write(content)
 
-        prov_hash = hashlib.sha512(content.encode("utf-8")).hexdigest()
         if self.pqc_priv_keys.get("dilithium"):
             try:
-                sig_bundle = sign_content_bundle(content.encode("utf-8"), None, self.pqc_priv_keys["dilithium"], self.pqc_priv_keys.get("rsa"))
+                sig_bundle = sign_content_bundle(content.encode("utf-8"), None,
+                                                 self.pqc_priv_keys["dilithium"], self.pqc_priv_keys.get("rsa"))
                 sig_b64 = base64.b64encode(json.dumps(sig_bundle).encode("utf-8"))
                 with open(sig_path, "wb") as sf:
                     sf.write(sig_b64)

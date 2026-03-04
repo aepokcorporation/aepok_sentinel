@@ -16,11 +16,9 @@ a JSON file accompanied by a signature, ensuring tamper-evident persistence. Key
 import os
 import sys
 import json
-import logging
 import subprocess
 import time
-import datetime
-from typing import Dict, Set, Optional
+from typing import Dict
 
 from shutil import which
 from hashlib import sha256
@@ -34,8 +32,6 @@ from aepok_sentinel.core.constants import EventCode
 from aepok_sentinel.core.pqc_crypto import (
     sign_content_bundle,
     verify_content_signature,
-    CryptoSignatureError,
-    CryptoDecryptionError
 )
 
 logger = get_logger("autoban")
@@ -130,7 +126,7 @@ class AutobanManager:
 
     def record_bad_source(self, identifier: str, reason: str) -> None:
         """
-        Called when we detect a suspicious source. 
+        Called when we detect a suspicious source.
          - If autoban_enabled=False => skip.
          - If watch_only => log SOURCE_BLOCKED but no actual firewall action.
          - If already blocked => skip duplicate.
@@ -147,7 +143,8 @@ class AutobanManager:
             return
 
         if is_watch_only(self.license_mgr):
-            self._append_chain_event(EventCode.SOURCE_BLOCKED, {"source": identifier, "reason": reason, "action": "watch-only"})
+            self._append_chain_event(EventCode.SOURCE_BLOCKED, {
+                                     "source": identifier, "reason": reason, "action": "watch-only"})
             return
 
         # normal blocking
@@ -299,7 +296,8 @@ class AutobanManager:
             logger.warning("Missing/unreadable vendor_dilithium_pub.pem for blocklist verify: %s", e)
             return
 
-        import base64, json
+        import base64
+        import json
         try:
             sig_dict = json.loads(base64.b64decode(sig_bytes).decode("utf-8"))
         except Exception as e:
@@ -329,7 +327,8 @@ class AutobanManager:
                 dil_priv = kf.read()
 
             sig_bundle = sign_content_bundle(content_str.encode("utf-8"), self.config, dil_priv, None)
-            import base64, json as j
+            import base64
+            import json as j
             sig_b64 = base64.b64encode(j.dumps(sig_bundle).encode("utf-8"))
 
             with open(self.blocklist_file + ".sig", "wb") as sf:

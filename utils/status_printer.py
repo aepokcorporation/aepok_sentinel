@@ -11,9 +11,6 @@ Provides two functions:
 No directory creation or fallback logic needed here.
 """
 
-import sys
-from typing import Optional
-
 from aepok_sentinel.core.logging_setup import get_logger
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, is_watch_only, is_license_valid

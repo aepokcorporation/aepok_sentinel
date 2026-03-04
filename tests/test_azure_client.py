@@ -14,7 +14,6 @@ Verifies:
 import unittest
 from unittest.mock import patch, MagicMock
 
-import requests
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, LicenseState
 from aepok_sentinel.core.azure_client import AzureClient, AzureClientError

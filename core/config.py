@@ -20,7 +20,7 @@ Additionally:
 import os
 import json
 from pathlib import Path
-from typing import Optional, Any, Dict, List
+from typing import Any, Dict, List
 
 from aepok_sentinel.core import audit_chain
 from aepok_sentinel.core.logging_setup import get_logger

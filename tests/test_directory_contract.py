@@ -4,19 +4,17 @@ Tests for directory_contract.py, ensuring path handling, structure
 validation, and symlink/Unicode spoof checks operate correctly.
 """
 
-import os
 import pytest
 import shutil
 import unicodedata
-from pathlib import Path
 
 from aepok_sentinel.core.directory_contract import (
-    SENTINEL_RUNTIME_BASE,
     validate_runtime_structure,
     resolve_path,
     REQUIRED_DIRS,
     REQUIRED_FILES,
 )
+
 
 @pytest.fixture
 def mock_runtime(tmp_path):

@@ -14,12 +14,11 @@ import shutil
 import unittest
 import tempfile
 import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, LicenseState
 from aepok_sentinel.core.audit_chain import AuditChain
-from aepok_sentinel.core.constants import EventCode
 from aepok_sentinel.core.security_daemon import SecurityDaemon
 
 
@@ -82,7 +81,7 @@ class TestSecurityDaemon(unittest.TestCase):
         rec2 = json.loads(lines[1])
         # first is storing hash => no event
         # second => TAMPER_DETECTED
-        # Actually we get MALWARE_MATCH or TAMPER_DETECTED only if detected. 
+        # Actually we get MALWARE_MATCH or TAMPER_DETECTED only if detected.
         # Here it’s a tamper => TAMPER_DETECTED
         self.assertEqual(rec2["event"], "TAMPER_DETECTED")
 

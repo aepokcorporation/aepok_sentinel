@@ -14,9 +14,6 @@ No automatic RSA fallback is allowed when in STRICT/HARDENED modes, per config s
 import os
 import base64
 import hashlib
-import json
-import logging
-import ctypes
 from typing import Optional, Dict, Any
 
 from cryptography.hazmat.backends import default_backend
@@ -26,7 +23,6 @@ from cryptography.hazmat.primitives.ciphers import (
 from cryptography.hazmat.primitives import padding, hashes, hmac
 from cryptography.hazmat.primitives.asymmetric import (
     padding as asym_padding,
-    rsa
 )
 from cryptography.hazmat.primitives import serialization
 
@@ -67,7 +63,6 @@ def sanitize_on_shutdown():
     Clears any module-level buffers or ephemeral data to reduce memory retention.
     Call this at daemon/controller shutdown.
     """
-    global _ephemeral_storage
     for k, v in list(_ephemeral_storage.items()):
         if isinstance(v, bytearray):
             secure_zero(v)
@@ -164,7 +159,7 @@ def encrypt_file_payload(
             logger.warning("Fallback explicitly disallowed: strict_transport or enforcement mode enforced.")
         else:
             fallback_allowed = True
-            
+
     if fallback_allowed:
         try:
             rsa_public_key = _load_rsa_public_key(rsa_pub)
@@ -300,7 +295,7 @@ def decrypt_file_payload(
             logger.warning("RSA fallback blocked due to strict enforcement.")
         else:
             fallback_allowed = True
-            
+
     if fallback_allowed:
         logger.info("Attempting RSA fallback.")
         try:

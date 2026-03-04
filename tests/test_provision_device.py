@@ -11,14 +11,12 @@ Covers:
 
 import os
 import shutil
-import json
 import unittest
 import tempfile
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from aepok_sentinel.core.provision_device import ProvisionDevice, ProvisionError
 from aepok_sentinel.core.audit_chain import AuditChain
-from aepok_sentinel.core.constants import EventCode
 
 
 class TestProvisionDevice(unittest.TestCase):

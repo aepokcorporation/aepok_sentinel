@@ -12,8 +12,6 @@ create or modify them.
 """
 
 import json
-import logging
-from pathlib import Path
 
 from aepok_sentinel.core.logging_setup import get_logger
 from aepok_sentinel.core.directory_contract import resolve_path

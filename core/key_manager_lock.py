@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 class KeyRotationLock:
     """
-    A context manager for exclusive file locking in key rotation. 
+    A context manager for exclusive file locking in key rotation.
     """
 
     def __init__(self, lockfile_path: str, must_fail_on_error: bool):

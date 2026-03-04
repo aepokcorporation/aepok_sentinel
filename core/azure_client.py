@@ -10,7 +10,6 @@ A minimal Azure Key Vault client supporting:
 """
 
 import requests
-from typing import Optional
 
 from aepok_sentinel.core.logging_setup import get_logger
 from aepok_sentinel.core.config import SentinelConfig

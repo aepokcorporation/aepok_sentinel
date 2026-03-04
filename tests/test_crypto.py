@@ -13,13 +13,12 @@ Verifies:
 Skips if 'oqs' is unavailable.
 """
 
-import os
 import unittest
 import base64
 from unittest import skipIf, mock
 
 from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives import serialization
 
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core import pqc_crypto
@@ -29,7 +28,6 @@ from aepok_sentinel.core.pqc_crypto import (
     sign_content_bundle,
     verify_content_signature,
     CryptoDecryptionError,
-    CryptoSignatureError,
     oqs,
     sanitize_on_shutdown
 )

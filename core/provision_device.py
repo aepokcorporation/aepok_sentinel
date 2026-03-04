@@ -13,7 +13,9 @@ Steps:
  6. build_trust_anchor() - gather hashes, sign with vendor_dil private key
  7. lock_provisioning() - writes provisioning_complete.flag
  8. append_audit_log() - logs to chain with EventCode.DEVICE_PROVISIONED
- 9. Self-Destruct if success => remove provision_device.py & installer_dilithium_priv.bin, zero mem, log ExtendedEventCode.DEVICE_PROVISIONED_SECURE
+ 9. Self-Destruct if success => remove provision_device.py &
+    installer_dilithium_priv.bin, zero mem, log
+    ExtendedEventCode.DEVICE_PROVISIONED_SECURE
 
 Failsafe behaviors:
  - Any signature fail => abort
@@ -23,24 +25,20 @@ Failsafe behaviors:
  - If all steps pass => final self-destruction
 """
 
-import sys
 import json
 import hashlib
-import logging
 from typing import Dict, Any, Optional
-import shutil
 import base64
 
 from pathlib import Path
 
 from aepok_sentinel.core.logging_setup import get_logger
-from aepok_sentinel.utils.sentinelrc_schema import validate_sentinelrc
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, LicenseError
 from aepok_sentinel.core.key_manager import KeyManager
 from aepok_sentinel.core.audit_chain import AuditChain
 from aepok_sentinel.core.directory_contract import resolve_path, SENTINEL_RUNTIME_BASE
-from aepok_sentinel.core.pqc_crypto import sign_content_bundle, CryptoSignatureError, oqs
+from aepok_sentinel.core.pqc_crypto import sign_content_bundle, oqs
 from aepok_sentinel.core.constants import EventCode
 
 logger = get_logger("provision_device")
@@ -79,7 +77,7 @@ class ProvisionDevice:
         self._trust_anchor_path = resolve_path("config", "trust_anchor.json")
         self._keys_dir = resolve_path("keys")
         self._installer_key_path = resolve_path("keys", "installer_dilithium_priv.bin")
-        
+
         self._vendor_dil_priv: bytearray = bytearray()
         self._vendor_dil_pub: bytes = b""
         self._license_mgr: Optional[LicenseManager] = None
@@ -284,7 +282,8 @@ class ProvisionDevice:
             # FIX #73: Added schema_version to ephemeral config — SentinelConfig.__init__
             # requires raw_dict["schema_version"] (not .get()), so omitting it causes KeyError.
             ephemeral_config = SentinelConfig({"schema_version": 1, "mode": "cloud", "allow_classical_fallback": False})
-            sig_bundle = sign_content_bundle(identity_json.encode("utf-8"), ephemeral_config, self._installer_priv, None)
+            sig_bundle = sign_content_bundle(identity_json.encode(
+                "utf-8"), ephemeral_config, self._installer_priv, None)
 
             sig_b64 = base64.b64encode(json.dumps(sig_bundle).encode("utf-8"))
             with open(f"{self._identity_path}.sig", "wb") as sf:
@@ -495,7 +494,8 @@ class ProvisionDevice:
 
         missing_required = [r for r in required_paths if r not in present_keys]
         if missing_required or not (has_kyber and has_dil):
-            raise ProvisionError(f"trust_anchor missing files => missing={missing_required}, kyber={has_kyber}, dil={has_dil}")
+            raise ProvisionError(
+                f"trust_anchor missing files => missing={missing_required}, kyber={has_kyber}, dil={has_dil}")
 
         try:
             identity_bytes = self._identity_path.read_bytes()

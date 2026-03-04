@@ -9,7 +9,6 @@ Covers:
  - Basic coverage of group retrieval logic
 """
 
-import os
 import ssl
 import unittest
 from unittest.mock import patch, MagicMock
