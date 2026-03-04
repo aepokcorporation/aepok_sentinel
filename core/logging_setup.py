@@ -217,11 +217,16 @@ def init_logging(
 
 def get_logger(name: str) -> logging.Logger:
     """
-    Retrieves a logger instance by name. init_logging() must have been called
-    beforehand; otherwise, the logging system is uninitialized.
+    Retrieves a logger instance by name.
+
+    If init_logging() has not been called yet (common during module-level
+    import time), returns a logger with a NullHandler so that import
+    ordering does not cause a RuntimeError.  Once init_logging() configures
+    the root logger, all previously-created child loggers automatically
+    pick up the new handlers via propagation.
     """
+    lgr = logging.getLogger(name)
     if not _LOGGING_INITIALIZED:
-        raise RuntimeError(
-            "Logging not initialized. Call init_logging(...) before get_logger(...)."
-        )
-    return logging.getLogger(name)
+        if not lgr.handlers:
+            lgr.addHandler(logging.NullHandler())
+    return lgr

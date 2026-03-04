@@ -304,7 +304,7 @@ class SecurityDaemon:
 
         timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         composite_name = f"{basename}__{sha256}__{timestamp}"
-        q_path = self.quarantine_dir / composite_nam
+        q_path = self.quarantine_dir / composite_name
         
         try:
             shutil.move(filepath, q_path)
@@ -503,9 +503,10 @@ class SecurityDaemon:
         """
         return None
 
-    def _log_chain_event(self, event_code: EventCode, metadata: dict) -> None:
+    def _log_chain_event(self, event_code, metadata: dict) -> None:
         try:
-            self.audit_chain.append_event(event_code.value, metadata)
+            code_str = event_code.value if isinstance(event_code, EventCode) else str(event_code)
+            self.audit_chain.append_event(code_str, metadata)
         except ChainTamperDetectedError as e:
             logger.error("Chain tampering detected while logging event %s: %s", event_code, e)
         except Exception as ex:

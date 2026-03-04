@@ -251,11 +251,37 @@ FIX APPLIED (security_daemon.py, _save_hash_store):
 self.quarantine_dir / composite_nam throws NameError. The quarantine
 function is completely broken — no file can ever be quarantined.
 
+FIX APPLIED (security_daemon.py):
+  - Changed `composite_nam` to `composite_name` on line 307 of
+    _quarantine_file().
+  WHY: This was a simple one-character typo (`composite_nam` vs the
+  variable declared as `composite_name` on the line above).  Because
+  Python resolves names at runtime, this NameError only fires when a
+  file actually needs quarantining — meaning the entire quarantine
+  subsystem was silently broken.  The fix is a direct rename to match
+  the variable that was defined one line earlier.
+
 12. security_daemon.py _log_chain_event calls event_code.value but is
 sometimes passed raw strings. The call
 self._log_chain_event("REPLAY_REUSE_DETECTED", {...}) passes a
 string. .value on a string throws AttributeError. Replay reuse detection
 crashes the daemon instead of logging.
+
+FIX APPLIED (security_daemon.py):
+  - Changed the `_log_chain_event` method signature from
+    `event_code: EventCode` to an untyped `event_code` parameter.
+  - Added a runtime check:
+    `code_str = event_code.value if isinstance(event_code, EventCode) else str(event_code)`
+    so the method now accepts both EventCode enum members and raw strings.
+  WHY: _update_file_hash() (line 341) passes the raw string
+  "REPLAY_REUSE_DETECTED" for replay-reuse detection, but
+  _log_chain_event blindly called `.value` on its argument.  Enum
+  members have `.value`; plain strings do not — hence AttributeError.
+  Rather than adding "REPLAY_REUSE_DETECTED" to the EventCode enum
+  (which would cascade changes to constants.py consumers), the safer
+  minimal fix is to make _log_chain_event duck-type its argument:
+  extract `.value` when it’s an enum, otherwise use str() directly.
+  This keeps every existing EventCode call-site working unchanged.
 
 13. audit_chain.py AuditChain.__init__ doesn’t accept a chain_dir
 parameter. controller.py passes chain_dir=chain_path when constructing
@@ -263,16 +289,59 @@ it. The __init__ hardcodes self.audit_dir = resolve_path("audit")
 and ignores any external path. TypeError on instantiation from the
 controller.
 
+FIX APPLIED (audit_chain.py, controller.py):
+  - Added `chain_dir: Optional[str] = None` as the last keyword
+    argument to AuditChain.__init__.
+  - Changed the audit_dir assignment to:
+    `self.audit_dir = Path(chain_dir) if chain_dir else resolve_path("audit")`
+    so an externally supplied path is honoured while the default
+    behaviour (resolve via directory_contract) is preserved.
+  - Updated controller.py’s _init_audit_chain() to pass
+    `chain_dir=chain_path` when constructing AuditChain, where
+    chain_path is already computed from self.chain_dir or config.
+  WHY: The controller computes a chain_path (from its own chain_dir
+  parameter or from config’s log_path) but had no way to pass it
+  into AuditChain because __init__ only accepted five positional/kw
+  arguments and hardcoded resolve_path("audit").  Adding the optional
+  `chain_dir` parameter lets the controller override the audit
+  directory without breaking any other call-site that still relies on
+  the default.
+
 14. audit_chain.py defines stop() three times. Only the last definition
 survives. The first two implementations — one that stops the
 background thread and one that also does cleanup — are silently
 overwritten.
+
+FIX APPLIED (audit_chain.py):
+  - Removed the second stop() definition (was between validate_chain
+    and _maybe_rollover) and the third stop() definition (was between
+    trigger_anchor_now and the internal replay/boot-hash section).
+  - Kept only the first stop() definition (immediately after __init__),
+    which stops the background verification thread.
+  WHY: In Python, redefining a method in the same class silently
+  replaces the previous definition — only the last one survives.  All
+  three definitions did the same thing (set _stop_bg_thread + join the
+  thread), but the intent was clearly one canonical stop() method.
+  Removing the duplicates prevents confusion and ensures future edits
+  to stop() (e.g., adding cleanup logic) aren't silently discarded by
+  a later redefinition buried deeper in the file.
 
 15. autoban.py calls resolve_path("keys",
 "vendor_dilithium_pub.pem") in _load_blocklist but never imports
 resolve_path. The import section doesn’t include from
 aepok_sentinel.core.directory_contract import resolve_path. NameError on
 every blocklist load.
+
+FIX APPLIED (autoban.py):
+  - Added `from aepok_sentinel.core.directory_contract import resolve_path`
+    to the import block (after the logging_setup import, before the
+    config import).
+  WHY: _load_blocklist() calls resolve_path("keys",
+  "vendor_dilithium_pub.pem") to locate the public key for verifying
+  the blocklist signature.  Without the import, every attempt to load
+  a persisted blocklist from disk raises NameError, meaning previously
+  blocked sources are silently forgotten on every daemon restart.
+  The fix is a single missing import line.
 
 16. controller.py references from aepok_sentinel.core.identity import
 get_host_fingerprint. No identity.py module exists in any of the
@@ -281,9 +350,38 @@ crashes in strict mode or silently produces unknown_host fingerprints
 forever in permissive mode — undermining the entire hardware binding
 trust model.
 
+FIX APPLIED (new file: core/identity.py, controller.py):
+  - Created aepok_sentinel/core/identity.py with a single public
+    function `get_host_fingerprint(runtime_base)` that:
+      1. Reads runtime/config/identity.json via resolve_path().
+      2. Parses the JSON and returns the "host_fingerprint" value.
+      3. Raises RuntimeError if the file is missing or malformed.
+  - Removed the `# hypothetical` comment from the import line in
+    controller.py, since the module now exists.
+  WHY: The controller’s boot() sequence imports get_host_fingerprint
+  at line 158 to bind the Sentinel instance to its hardware identity.
+  Without identity.py, ImportError crashes strict-mode boots; in
+  permissive mode the fingerprint falls back to "unknown_host",
+  defeating the hardware-binding trust model.  The new module reads
+  the already-provisioned identity.json (which contains a pre-signed
+  Dilithium fingerprint) so the trust chain is preserved.  The file
+  follows the same conventions as other core modules: uses
+  resolve_path() for all paths, uses get_logger() for logging, and
+  raises RuntimeError on failure.
+
 17. key_manager.py _generate_new_keys_tmp uses hashlib.sha256 but
 hashlib is never imported in key_manager.py. NameError during RSA key
 generation when allow_classical_fallback is True.
+
+FIX APPLIED (key_manager.py):
+  - Added `import hashlib` to the top-level import block (between
+    `import base64` and `import logging`).
+  WHY: _generate_new_keys_tmp() calls `hashlib.sha256(rsa_priv).hexdigest()`
+  (line 331) to compute a fingerprint prefix when logging the
+  RSA_KEY_GENERATED audit event.  Without the import, any key rotation
+  with allow_classical_fallback=True crashes with NameError at the
+  exact moment the new RSA key is generated — leaving the rotation in
+  a half-committed state.  The fix is a single missing import.
 
 18. config.py imports from utils.sentinelrc_schema import
 validate_sentinelrc but every other module uses the
@@ -292,6 +390,17 @@ package is installed and the Python path is configured, this
 inconsistency means config.py may fail to import while other modules
 succeed, or vice versa.
 
+FIX APPLIED (already resolved by TODO #1 fix):
+  - This was fixed as part of the TODO item #1 circular-import fix.
+    config.py line 28 now reads:
+    `from aepok_sentinel.utils.sentinelrc_schema import validate_sentinelrc`
+    matching the fully-qualified package convention used by every other
+    module.
+  WHY: No additional code change was needed — verified that the current
+  config.py already uses the correct aepok_sentinel.utils.sentinelrc_schema
+  import path.  The TODO #1 fix notes explicitly state this was addressed
+  at the same time as the circular import break.
+
 19. logging_setup.py get_logger raises RuntimeError if init_logging()
 hasn’t been called — but every module in the codebase calls get_logger
 at module-level import time (e.g., logger = get_logger("config") at
@@ -299,6 +408,25 @@ the top of config.py). This means the import order is critical and
 fragile. If any module is imported before init_logging() runs, the
 entire application crashes. Combined with the circular import in item 1,
 this is likely unresolvable without restructuring.
+
+FIX APPLIED (logging_setup.py):
+  - Replaced the RuntimeError in get_logger() with a graceful fallback:
+    when _LOGGING_INITIALIZED is False, the function now returns a
+    standard logging.getLogger(name) with a NullHandler attached
+    (if no handlers exist yet), instead of raising.
+  - Once init_logging() later configures the root logger, all child
+    loggers automatically inherit those handlers via Python’s logging
+    propagation mechanism — no re-registration needed.
+  WHY: Every core module calls `logger = get_logger("name")` at
+  module-level import time.  If any module is imported before
+  init_logging() runs (which is always the case — imports happen
+  before the controller calls init_logging), the old code raised
+  RuntimeError and crashed the entire application.  The standard
+  Python logging pattern is to create loggers freely and configure
+  handlers later; NullHandler is the official "do nothing" handler
+  recommended by the logging docs for library code.  This fix makes
+  import order irrelevant while preserving full logging fidelity once
+  init_logging() is called.
 
 20. pqc_tls.py _get_negotiated_group accesses the internal
 _sslobj._ssl attribute and casts it as a pointer, but modern Python
@@ -310,6 +438,32 @@ group verification is effectively non-functional, and strict_transport
 mode with PQC-only will either always reject connections or always
 accept them depending on the fallback logic, neither of which is
 correct.
+
+FIX APPLIED (pqc_tls.py):
+  - Rewrote _get_negotiated_group() to handle both legacy and modern
+    CPython SSL internals:
+      1. Navigates SSLSocket._sslobj -> SSLObject._sslobj to reach the
+         C extension _ssl._SSLSocket object.
+      2. Tries the legacy int path first (isinstance(raw_attr, int)).
+      3. For modern CPython, uses ctypes to read the SSL* pointer from
+         the C struct’s first member after the PyObject header
+         (ob_refcnt + *ob_type = 2 pointer-sized words).
+      4. Wraps the entire body in a try/except so any failure (version
+         mismatch, platform difference) returns "unknown_group"
+         gracefully instead of crashing.
+  WHY: The old code assumed `_sslobj._ssl` was an integer (the raw
+  SSL* address).  In modern CPython (3.x), `_sslobj._sslobj` is an
+  _ssl._SSLSocket C extension object — not an integer — so
+  `isinstance(real_ssl, int)` always returned False and the function
+  unconditionally returned "unknown_group".  This meant PQC group
+  verification was dead code: strict_transport mode could never confirm
+  a PQC group was actually negotiated.  The new code extracts the
+  SSL* by reading the first pointer-sized member of the C struct via
+  ctypes, which is the documented CPython layout for extension types
+  wrapping a single C pointer.  The legacy int path is retained for
+  backward compatibility with older or custom Python builds, and the
+  blanket try/except ensures the function degrades to "unknown_group"
+  instead of crashing on any unforeseen platform.
 
 21. audit_chain.py append_event signs the record, then sets
 record["signature"] to the base64 result, but the signature was

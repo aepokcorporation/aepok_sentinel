@@ -121,7 +121,8 @@ class AuditChain:
         pqc_pub_keys: Dict[str, bytes],
         max_size_bytes: int = 100 * 1024 * 1024,
         background_verification_interval: int = 0,
-        anchor_config: Optional[Dict[str, Any]] = None
+        anchor_config: Optional[Dict[str, Any]] = None,
+        chain_dir: Optional[str] = None
     ):
         """
         :param pqc_priv_keys: e.g. {"dilithium": b"...", "rsa": b"..."} for signing new events
@@ -129,9 +130,12 @@ class AuditChain:
         :param max_size_bytes: chain rollover threshold
         :param background_verification_interval: minutes between auto-verify attempts (0=off)
         :param anchor_config: optional config for external anchoring
+        :param chain_dir: optional override for the audit chain directory path;
+                          if None, defaults to resolve_path("audit")
         """
-        # Resolve "audit" folder via directory_contract
-        self.audit_dir = resolve_path("audit")
+        # Use caller-supplied chain_dir if provided; otherwise resolve via directory_contract
+        from pathlib import Path as _Path
+        self.audit_dir = _Path(chain_dir) if chain_dir else resolve_path("audit")
         if not self.audit_dir.is_dir():
             raise AuditChainError(
                 f"Audit directory missing: {self.audit_dir}. Cannot proceed."
@@ -348,12 +352,6 @@ class AuditChain:
 
         return True
 
-    def stop(self):
-        """Cleanly stops background verification if running."""
-        if self._bg_thread and self._bg_thread.is_alive():
-            self._stop_bg_thread.set()
-            self._bg_thread.join()
-
     def _maybe_rollover(self):
         if not self.chain_file.is_file():
             return
@@ -464,11 +462,6 @@ class AuditChain:
 
         cpoint = os.path.join(self.audit_dir, sorted(files, reverse=True)[0])
         self._submit_to_external_anchor(final_root, cpoint)
-
-    def stop(self):
-        if self._bg_thread and self._bg_thread.is_alive():
-            self._stop_bg_thread.set()
-            self._bg_thread.join()
 
     # ------------------------------
     # Internal replay & boot hash
