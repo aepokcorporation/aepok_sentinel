@@ -25,7 +25,7 @@ from typing import Optional, Any, Dict, List
 from aepok_sentinel.core import audit_chain
 from aepok_sentinel.core.logging_setup import get_logger
 from aepok_sentinel.core.directory_contract import resolve_path
-from utils.sentinelrc_schema import validate_sentinelrc
+from aepok_sentinel.utils.sentinelrc_schema import validate_sentinelrc
 
 logger = get_logger("config")
 
@@ -88,6 +88,12 @@ class SentinelConfig:
         self.license_required: bool = raw_dict.get("license_required", False)
         self.bound_to_hardware: bool = raw_dict.get("bound_to_hardware", False)
         self.license_type: str = raw_dict.get("license_type", "individual")
+
+        # TLS and cloud fields — these MUST be set as attributes because
+        # pqc_tls.py, pqc_tls_verify.py, malware_db.py, azure_client.py, and
+        # status_printer.py all access config.tls_mode / config.cloud_keyvault_url.
+        self.tls_mode: str = raw_dict.get("tls_mode", "hybrid")
+        self.cloud_keyvault_url: str = raw_dict.get("cloud_keyvault_url", "")
 
         # Additional advanced fields
         self.use_cbc_hmac: bool = raw_dict.get("use_cbc_hmac", False)
@@ -185,7 +191,14 @@ class SentinelConfig:
             "use_cbc_hmac", "allow_classical_fallback", "cloud_keyvault_enabled",
             "cloud_keyvault_provider", "manual_key_entry_enabled",
             "max_concurrent_workers", "use_inotify", "allow_unknown_keys",
-            "enforcement_mode", "_signature_verified"
+            "enforcement_mode", "_signature_verified",
+            # TLS, cloud, autoban, and anchor keys used by advanced modules
+            "tls_mode", "cloud_dilithium_secret", "cloud_kyber_secret",
+            "cloud_rsa_secret", "cloud_malware_url",
+            "autoban_enabled", "autoban_block_ttl_days",
+            "trusted_firewall_hashes", "allowed_tls_groups",
+            "anchor_export_path", "signer_id", "host_fingerprint",
+            "key_fingerprint",
         }
         for key in self.raw_dict.keys():
             if key not in known_keys and not self.allow_unknown_keys:

@@ -58,6 +58,34 @@ class AuditChainError(Exception):
     """General error within AuditChain initialization or runtime."""
 
 
+# ---------------------------------------------------------------------------
+# Module-level singleton reference and convenience function.
+# Other modules (config.py, logging_setup.py, pqc_crypto.py, etc.) call
+#   audit_chain.append_event(event, metadata)
+# as if it were a free function.  Without this shim every such call would
+# raise AttributeError because append_event is an instance method.  The
+# controller registers the live AuditChain instance after construction via
+# set_global_chain(); append_event() then delegates to it.  If no instance
+# has been registered yet the call is silently dropped — this is safe
+# because it only happens during early startup before the chain exists.
+# ---------------------------------------------------------------------------
+_global_chain_instance: Optional["AuditChain"] = None
+
+
+def set_global_chain(instance: Optional["AuditChain"]) -> None:
+    """Register (or clear) the module-level AuditChain singleton."""
+    global _global_chain_instance
+    _global_chain_instance = instance
+
+
+def append_event(event: str, metadata: Dict[str, Any]) -> None:
+    """Module-level convenience wrapper so callers can do
+    ``audit_chain.append_event(...)`` without holding an instance reference.
+    Silently no-ops if no AuditChain has been registered yet."""
+    if _global_chain_instance is not None:
+        _global_chain_instance.append_event(event, metadata)
+
+
 def _lock_file(file_obj):
     if platform.system() == "Windows":
         msvcrt.locking(file_obj.fileno(), msvcrt.LK_LOCK, 1)
