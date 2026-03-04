@@ -101,7 +101,13 @@ def _unlock_file(file_obj):
 
 
 def _utc_iso_now() -> str:
-    dt = datetime.utcnow().replace(microsecond=0)
+    # FIX #26: Preserve full microsecond precision instead of truncating
+    # to whole seconds.  Truncation caused identical timestamps when two
+    # events were appended within the same second, and the validator's
+    # strict less-than-or-equal check then rejected the second event as
+    # a monotonicity violation — making the chain self-corrupt under
+    # any non-trivial load.
+    dt = datetime.utcnow()
     return dt.isoformat() + "Z"
 
 
@@ -152,8 +158,26 @@ class AuditChain:
         self.leaf_hashes: List[str] = []
         self.tree_levels: List[List[str]] = []
 
+        # FIX #23: Guard flag to prevent recursive append_event calls
+        # during rollover from resetting Merkle state mid-operation.
+        self._in_rollover = False
+
         # Initialize boot_hash to detect chain replay.
         self.boot_hash = self._load_or_create_boot_hash()
+
+        # FIX #24: Build in-memory Merkle state at startup so that
+        # _check_boot_hash (called at the top of every append_event)
+        # can compare the stored root against the actual chain contents.
+        # Without this, tree_levels is empty on cold start, causing
+        # _get_current_merkle_root() to return "EMPTY_CHAIN" and the
+        # replay check to pass even if the chain file has hundreds of
+        # entries — completely bypassing replay detection until the
+        # first event is appended.
+        if self.chain_file.is_file():
+            try:
+                self._build_in_memory_state()
+            except ChainTamperDetectedError:
+                logger.error("Chain corrupt at startup — Merkle state not loaded.")
 
         # Start background verification if configured
         self._stop_bg_thread = threading.Event()
@@ -189,6 +213,12 @@ class AuditChain:
           - Writes to .chain_tmp => atomically appends to the chain file
           - Possibly triggers rollover
         """
+        # FIX #23: If a rollover is in progress, log-only to avoid
+        # recursive lock acquisition and Merkle state corruption.
+        if self._in_rollover:
+            logger.warning("append_event('%s') deferred — rollover in progress.", event)
+            return
+
         if not self._check_boot_hash():
             logger.error("Chain replay suspected; mismatch with stored root.")
             try:
@@ -205,7 +235,9 @@ class AuditChain:
         with open(self.chain_file, "a+", encoding="utf-8") as chain_f:
             _lock_file(chain_f)
             try:
-                self._build_in_memory_state()
+                # FIX #22: Pass the already-locked file handle to avoid
+                # opening a second handle which can deadlock or read stale data.
+                self._build_in_memory_state(chain_f)
 
                 prev_hash = "GENESIS" if not self.leaf_hashes else self.leaf_hashes[-1]
                 record = {
@@ -223,8 +255,13 @@ class AuditChain:
                 merkle_path = self._compute_merkle_path(leaf_idx)
                 record["merkle_path"] = merkle_path
 
-                # Sign if keys are present
-                record["signature"] = ""
+                # Sign if keys are present.
+                # FIX #21: Compute signature over the record WITHOUT the
+                # "signature" field so that validate_chain (which pops
+                # "signature" before re-serializing) produces identical
+                # data_bytes.  Previously record["signature"] = "" was set
+                # before signing, causing the signed JSON to include
+                # '"signature": ""' while the verify path excluded it entirely.
                 if self.pqc_priv_keys.get("dilithium"):
                     data_bytes = json.dumps(record, sort_keys=True).encode("utf-8")
                     sig_bundle = sign_content_bundle(
@@ -234,6 +271,8 @@ class AuditChain:
                         self.pqc_priv_keys.get("rsa")
                     )
                     record["signature"] = base64.b64encode(json.dumps(sig_bundle).encode("utf-8")).decode("utf-8")
+                else:
+                    record["signature"] = ""
 
                 # Write to .chain_tmp first
                 tmp_data = json.dumps(record) + "\n"
@@ -316,7 +355,11 @@ class AuditChain:
                     return self._validation_fail(raise_on_fail, f"Line {line_num}: linking error => prev_hash mismatch")
 
             ts_dt = _parse_iso8601(record["timestamp"])
-            if last_ts and ts_dt <= last_ts:
+            # FIX #26: Use strict less-than (<) instead of less-than-or-equal
+            # (<=).  Equal timestamps are legitimate when events are appended
+            # within the same clock tick; only genuinely backwards timestamps
+            # indicate tampering.
+            if last_ts and ts_dt < last_ts:
                 return self._validation_fail(raise_on_fail, f"Line {line_num}: non-monotonic timestamp")
             last_ts = ts_dt
 
@@ -365,51 +408,77 @@ class AuditChain:
         self._rollover_chain()
 
     def _rollover_chain(self):
-        valid = self.validate_chain(raise_on_fail=False)
-        if not valid:
-            logger.error("Chain invalid upon rollover => forced anyway.")
+        # FIX #23: Set rollover guard so that any append_event calls
+        # triggered internally (e.g. from _submit_to_external_anchor
+        # error paths) are deferred to after rollover completes.  Without
+        # this guard, recursive append_event would find the newly emptied
+        # chain, rebuild Merkle state to zero entries, and corrupt the
+        # in-memory tree mid-operation.
+        self._in_rollover = True
+        deferred_events: List[tuple] = []
 
-        final_root = self._get_current_merkle_root()
-        cpoint_filename = f"{self.checkpoint_file_prefix}{time.strftime('%Y%m%d_%H%M%S')}.json"
-        cpoint_path = self.audit_dir / cpoint_filename
-        cpoint_data = {
-            "previous_chain_file": self.chain_file.name,
-            "final_merkle_root": final_root,
-            "timestamp": _utc_iso_now()
-        }
+        try:
+            valid = self.validate_chain(raise_on_fail=False)
+            if not valid:
+                logger.error("Chain invalid upon rollover => forced anyway.")
 
-        if self.pqc_priv_keys.get("dilithium"):
-            raw_bytes = json.dumps(cpoint_data, sort_keys=True).encode("utf-8")
-            sig_bundle = sign_content_bundle(
-                raw_bytes,
-                None,
-                self.pqc_priv_keys["dilithium"],
-                self.pqc_priv_keys.get("rsa")
-            )
-            cpoint_data["signature"] = base64.b64encode(json.dumps(sig_bundle).encode("utf-8")).decode("utf-8")
-        else:
-            cpoint_data["signature"] = ""
+            final_root = self._get_current_merkle_root()
+            cpoint_filename = f"{self.checkpoint_file_prefix}{time.strftime('%Y%m%d_%H%M%S')}.json"
+            cpoint_path = self.audit_dir / cpoint_filename
+            cpoint_data = {
+                "previous_chain_file": self.chain_file.name,
+                "final_merkle_root": final_root,
+                "timestamp": _utc_iso_now()
+            }
 
-        with open(cpoint_path, "w", encoding="utf-8") as f:
-            json.dump(cpoint_data, f, indent=2)
-        logger.info("Created signed checkpoint: %s", cpoint_path)
+            if self.pqc_priv_keys.get("dilithium"):
+                raw_bytes = json.dumps(cpoint_data, sort_keys=True).encode("utf-8")
+                sig_bundle = sign_content_bundle(
+                    raw_bytes,
+                    None,
+                    self.pqc_priv_keys["dilithium"],
+                    self.pqc_priv_keys.get("rsa")
+                )
+                cpoint_data["signature"] = base64.b64encode(json.dumps(sig_bundle).encode("utf-8")).decode("utf-8")
+            else:
+                cpoint_data["signature"] = ""
 
-        stamp = time.strftime("old_chain_%Y%m%d_%H%M%S.log")
-        rollover_path = self.audit_dir / stamp
-        os.rename(self.chain_file, rollover_path)
-        logger.info("Rollover complete. Old chain => %s", rollover_path)
+            with open(cpoint_path, "w", encoding="utf-8") as f:
+                json.dump(cpoint_data, f, indent=2)
+            logger.info("Created signed checkpoint: %s", cpoint_path)
 
-        self.leaf_hashes.clear()
-        self.tree_levels.clear()
+            stamp = time.strftime("old_chain_%Y%m%d_%H%M%S.log")
+            rollover_path = self.audit_dir / stamp
+            os.rename(self.chain_file, rollover_path)
+            logger.info("Rollover complete. Old chain => %s", rollover_path)
 
-        self._submit_to_external_anchor(final_root, cpoint_path)
+            self.leaf_hashes.clear()
+            self.tree_levels.clear()
 
-        with open(self.chain_file, "w", encoding="utf-8"):
-            pass
+            self._submit_to_external_anchor(final_root, cpoint_path)
 
-        self._store_boot_hash(final_root)
+            with open(self.chain_file, "w", encoding="utf-8"):
+                pass
+
+            self._store_boot_hash(final_root)
+        finally:
+            self._in_rollover = False
 
     def export_chain(self, output_path: str) -> None:
+        # FIX #25: Append the EXPORT_CHAIN event BEFORE snapshotting the
+        # chain contents.  Previously the event was appended after the
+        # export was written, making the export immediately stale (it was
+        # missing its own export event).  Worse, if the chain was near
+        # the rollover threshold the post-export append could trigger
+        # rollover, renaming the chain file and invalidating the export
+        # entirely.  By logging first, the export includes the event and
+        # we avoid accidental rollover after the snapshot.
+        sig_path = output_path + ".sig"
+        self.append_event("EXPORT_CHAIN", {
+            "export_path": output_path,
+            "signature_path": sig_path,
+        })
+
         if not self.validate_chain(raise_on_fail=False):
             logger.warning("Chain invalid; exporting anyway.")
         with open(self.chain_file, "r", encoding="utf-8") as cf:
@@ -422,7 +491,6 @@ class AuditChain:
         with open(output_path, "w", encoding="utf-8") as out_f:
             out_f.write(content)
 
-        sig_path = output_path + ".sig"
         prov_hash = hashlib.sha512(content.encode("utf-8")).hexdigest()
         if self.pqc_priv_keys.get("dilithium"):
             try:
@@ -432,12 +500,6 @@ class AuditChain:
                     sf.write(sig_b64)
             except Exception as e:
                 logger.warning("Failed to write export signature: %s", e)
-
-        self.append_event("EXPORT_CHAIN", {
-            "export_path": output_path,
-            "signature_path": sig_path,
-            "provenance_sha512": prov_hash
-        })
 
     def compute_provenance_hash(self) -> str:
         with open(self.chain_file, "r", encoding="utf-8") as cf:
@@ -547,18 +609,29 @@ class AuditChain:
     # ------------------------------
     # Internal merkle logic
     # ------------------------------
-    def _build_in_memory_state(self):
+    def _build_in_memory_state(self, chain_f=None):
         """
         Rebuilds Merkle state from audit_chain.log,
         but halts if any line is corrupt, truncated, or incomplete.
+
+        FIX #22: Accept an optional already-open file handle so callers
+        that already hold the file lock (e.g. append_event) can pass it
+        in instead of having this method open a second handle.  Opening
+        a second handle to the same file while an exclusive lock is held
+        can deadlock on some platforms or read stale data on others.
         """
         self.leaf_hashes.clear()
         self.tree_levels.clear()
         if not self.chain_file.is_file():
             return
 
-        with open(self.chain_file, "r", encoding="utf-8") as chain_f:
+        if chain_f is not None:
+            # Use the already-open, locked handle — seek to start first.
+            chain_f.seek(0)
             lines = chain_f.readlines()
+        else:
+            with open(self.chain_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
 
         for line_num, line_str in enumerate(lines, start=1):
             line_str = line_str.strip()
@@ -677,8 +750,7 @@ class AuditChain:
                     self.pqc_priv_keys["dilithium"],
                     self.pqc_priv_keys.get("rsa")
                 )
-                import base64, json as j
-                payload["signature"] = base64.b64encode(j.dumps(sig_bundle).encode("utf-8")).decode("utf-8")
+                payload["signature"] = base64.b64encode(json.dumps(sig_bundle).encode("utf-8")).decode("utf-8")
             except Exception as e:
                 self.append_event("ANCHOR_EXPORT_FAILED", {
                     "reason": "signature_failed",

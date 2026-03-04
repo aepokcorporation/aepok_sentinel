@@ -234,25 +234,46 @@ class LicenseManager:
 
     def _verify_license_signature(self, lic_json: dict) -> bool:
         """
-        Extract the 'signature' field, decode it, compare the rest of the license fields with vendor_dilithium_pub.pem
+        Extract the 'signature' field, compare the rest of the license fields with vendor_dilithium_pub.pem
         If config.allow_classical_fallback => optionally load vendor_rsa_pub.pem as well.
         """
         if "signature" not in lic_json:
             return False
 
-        # Extract signature dict
-        # The license is a copy of lic_json except "signature" removed
+        # Extract signature — remove from copy so we can re-serialize the
+        # signed payload without it.
         lic_copy = dict(lic_json)
-        sig_b64 = lic_copy.pop("signature")
+        sig_val = lic_copy.pop("signature")
 
-        try:
-            sig_json_bytes = base64.b64decode(sig_b64)
-            sig_dict = json.loads(sig_json_bytes.decode("utf-8"))
-        except Exception as e:
-            logger.warning("License signature field not valid base64 or JSON: %s", e)
+        # FIX #27: issue_offline_license.py stores the signature as a raw
+        # dict inside the JSON blob (license_obj["signature"] = sig_dict).
+        # After the outer base64+JSON decode, the signature arrives here
+        # as a Python dict, NOT a base64 string.  The old code tried to
+        # base64.b64decode() on this dict, which raised TypeError.
+        # Now we handle both forms: dict (from issue_offline_license) and
+        # base64-encoded string (in case a future issuer encodes it).
+        if isinstance(sig_val, dict):
+            sig_dict = sig_val
+        elif isinstance(sig_val, str):
+            try:
+                sig_json_bytes = base64.b64decode(sig_val)
+                sig_dict = json.loads(sig_json_bytes.decode("utf-8"))
+            except Exception as e:
+                logger.warning("License signature field not valid base64 or JSON: %s", e)
+                return False
+        else:
+            logger.warning("License signature field has unexpected type: %s", type(sig_val).__name__)
             return False
 
-        data_bytes = json.dumps(lic_copy, sort_keys=True).encode("utf-8")
+        # FIX #28: issue_offline_license.py signs with compact JSON:
+        #   json.dumps(license_obj, separators=(",", ":"))
+        # The old verification used json.dumps(lic_copy, sort_keys=True)
+        # which produces different bytes (default separators include
+        # spaces: ", " and ": ", and sort_keys reorders fields).  The
+        # signed data bytes would never match the verification data bytes.
+        # Now we use the same compact serialization without sort_keys to
+        # match the issuer.
+        data_bytes = json.dumps(lic_copy, separators=(",", ":")).encode("utf-8")
 
         # Load anchored Dilithium pub key
         try:
@@ -295,7 +316,12 @@ class LicenseManager:
         try:
             content = self.identity_path.read_text(encoding="utf-8")
             ident_data = json.loads(content)
-            local_fprint = ident_data.get("fingerprint", "")
+            # FIX #30: provision_device.py generate_host_identity() writes
+            # the field as "host_fingerprint", not "fingerprint".  The
+            # mismatch meant local_fprint was always empty string, so
+            # hardware binding always failed for any legitimately bound
+            # license.
+            local_fprint = ident_data.get("host_fingerprint", "")
         except Exception as e:
             logger.warning("Failed to read identity.json for hardware bind check: %s", e)
             return False
@@ -340,11 +366,13 @@ class LicenseManager:
         return True
 
     def _get_local_host_fp(self) -> str:
-        """Reads identity.json to get 'fingerprint' field, or returns 'unknown' if fails."""
+        """Reads identity.json to get 'host_fingerprint' field, or returns 'unknown' if fails."""
         try:
             ident_str = self.identity_path.read_text(encoding="utf-8")
             obj = json.loads(ident_str)
-            return obj.get("fingerprint", "unknown")
+            # FIX #30: Same field name fix as _check_hardware_binding —
+            # identity.json uses "host_fingerprint", not "fingerprint".
+            return obj.get("host_fingerprint", "unknown")
         except Exception as e:
             logger.warning("Failed to read local host identity for install_count => %s", e)
             return "unknown"
@@ -375,9 +403,13 @@ class LicenseManager:
         try:
             content_str = self.install_state_path.read_text(encoding="utf-8")
             sig_bytes = sig_path.read_bytes()
-            import base64, json as j
-
-            sig_dict = j.loads(base64.b64decode(sig_bytes).decode("utf-8"))
+            # FIX #29: Removed local `import base64, json as j` that
+            # shadowed the module-level imports.  Both base64 and json
+            # are already imported at the top of this file.  The `j`
+            # alias was a maintenance trap — any code added later that
+            # used `j` outside this method would hit a NameError, and
+            # the shadowing made it unclear which json module was in use.
+            sig_dict = json.loads(base64.b64decode(sig_bytes).decode("utf-8"))
 
             # read vendor_dilithium_pub.pem
             pub_path = resolve_path("keys", "vendor_dilithium_pub.pem")
@@ -414,8 +446,10 @@ class LicenseManager:
             vendor_dil = priv_path.read_bytes()
 
             sig_bundle = sign_content_bundle(content_str.encode("utf-8"), self.config, vendor_dil, None)
-            import json as j, base64
-            sig_encoded = base64.b64encode(j.dumps(sig_bundle).encode("utf-8"))
+            # FIX #29: Use module-level json and base64 instead of
+            # re-importing locally with an alias.  See _load_install_state
+            # comment for full rationale.
+            sig_encoded = base64.b64encode(json.dumps(sig_bundle).encode("utf-8"))
             with open(str(self.install_state_path) + ".sig", "wb") as sf:
                 sf.write(sig_encoded)
 
