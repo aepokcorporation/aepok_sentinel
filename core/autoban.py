@@ -59,17 +59,33 @@ class AutobanManager:
         config: SentinelConfig,
         license_mgr: LicenseManager,
         audit_chain: AuditChain,
-        blocklist_file: str = "/var/lib/sentinel/blocked_ips.json",
-        sign_priv_key_path: str = "/var/lib/sentinel/autoban_dilithium_priv.bin"
+        blocklist_file: str = None,
+        sign_priv_key_path: str = None
     ):
         self.config = config
         self.license_mgr = license_mgr
         self.audit_chain = audit_chain
-        self.blocklist_file = blocklist_file
-        self.sign_priv_key_path = sign_priv_key_path
 
-        # Ensure directory for the blocklist file exists (external location, not within sentinel runtime)
-        dir_path = os.path.dirname(blocklist_file)
+        # FIX #48: The old defaults pointed to /var/lib/sentinel/ — a path
+        # completely outside the directory contract.  The blocklist and its
+        # signature lived outside the runtime security boundary, so an
+        # attacker who could write to /var/lib/sentinel/ could replace them
+        # without triggering any trust anchor violation.  Now we default to
+        # paths inside the contracted runtime directory via resolve_path(),
+        # placing the blocklist under "config" (validated at startup) and
+        # the signing key under "keys" (also validated).
+        if blocklist_file is None:
+            self.blocklist_file = str(resolve_path("config", "blocked_ips.json"))
+        else:
+            self.blocklist_file = blocklist_file
+
+        if sign_priv_key_path is None:
+            self.sign_priv_key_path = str(resolve_path("keys", "autoban_dilithium_priv.bin"))
+        else:
+            self.sign_priv_key_path = sign_priv_key_path
+
+        # Ensure directory for the blocklist file exists
+        dir_path = os.path.dirname(self.blocklist_file)
         if not os.path.isdir(dir_path):
             raise RuntimeError(f"Directory for blocklist_file does not exist: {dir_path}")
 
@@ -91,26 +107,26 @@ class AutobanManager:
 
     def _get_fallback_trusted_hashes(self) -> list:
         """
-        Provide known-good fallback SHA-256 hashes for typical firewall binaries
-        if none are supplied in the config. This is only an example approach.
+        FIX #49: The old implementation computed SHA-256 of firewall binaries
+        at runtime and returned those as "trusted" hashes.  This is a security
+        vulnerability: if the firewall binary is already compromised, hashing
+        it at runtime and trusting that hash means you're trusting the
+        compromised binary.  Trusted hashes MUST be provisioned from a
+        known-good source (e.g. the config file, a signed manifest, or a
+        build-time attestation), not computed from whatever happens to be on
+        disk at runtime.
+
+        Now returns an empty list so autoban will correctly refuse to run any
+        firewall binary when no pre-provisioned hashes exist.  Operators must
+        supply trusted_firewall_hashes in the config.
         """
-        import hashlib
-        fallback = []
-        known_paths = [
-            "/usr/sbin/ufw",
-            "/sbin/iptables",
-            "C:\\Windows\\System32\\netsh.exe"
-        ]
-        for path in known_paths:
-            if os.path.isfile(path):
-                try:
-                    with open(path, "rb") as f:
-                        data = f.read()
-                    hval = hashlib.sha256(data).hexdigest()
-                    fallback.append(hval)
-                except Exception:
-                    continue
-        return fallback
+        logger.warning(
+            "No trusted_firewall_hashes in config. Firewall binary trust "
+            "cannot be established at runtime — hashes must be provisioned "
+            "from a known-good source. Autoban will be unable to execute "
+            "firewall commands until trusted hashes are configured."
+        )
+        return []
 
     def record_bad_source(self, identifier: str, reason: str) -> None:
         """
@@ -335,7 +351,18 @@ class AutobanManager:
             if os.path.basename(cmd_path) == "ipfw":
                 return [cmd_path, "add", "deny", "ip", "from", identifier, "to", "any"]
             else:
-                return [cmd_path, "-f", f"block drop from {identifier} to any"]
+                # FIX #50: The old code used `pfctl -f "block drop from <ip> to any"`.
+                # pfctl -f expects a *file path* to a rules file, not an
+                # inline rule string.  Passing the rule as an argument caused
+                # pfctl to try to open a file literally named "block drop from
+                # 1.2.3.4 to any", which always fails.
+                #
+                # The correct approach for pfctl is to use a persistent table.
+                # `pfctl -t sentinel_blocked -T add <ip>` adds the IP to the
+                # "sentinel_blocked" table.  The pf.conf must have a rule like
+                # `block drop from <sentinel_blocked>` for this to take effect.
+                # This is the standard pattern for dynamic IP blocking with pf.
+                return [cmd_path, "-t", "sentinel_blocked", "-T", "add", identifier]
         else:
             raise AutobanError(f"Unsupported platform '{platform_str}'")
 
