@@ -306,14 +306,19 @@ class KeyManager:
         tmp_dir = self.keys_dir / tmp_name
         tmp_dir.mkdir(exist_ok=False)
 
-        # Generate kyber
-        from oqs import KeyEncapsulation, Signature
-        with KeyEncapsulation("Kyber512") as kem:
+        # FIX #43: The old code did `from oqs import KeyEncapsulation, Signature`
+        # as a local import, going directly to the oqs package.  But the
+        # module-level guard imports `oqs` via pqc_crypto — if oqs is not
+        # installed, that reference is None and we already checked it above.
+        # The local `from oqs import ...` would throw a *different* ImportError
+        # with a confusing message.  Use the already-imported `oqs` module
+        # for consistent failure paths.
+        with oqs.KeyEncapsulation("Kyber512") as kem:
             kem.generate_keypair()
             kyb_priv = kem.export_secret_key()
 
         # Generate dilithium
-        with Signature("Dilithium2") as sig:
+        with oqs.Signature("Dilithium2") as sig:
             sig.generate_keypair()
             dil_priv = sig.export_secret_key()
 
@@ -368,28 +373,49 @@ class KeyManager:
         """
         Move each file from tmp_dir => keys_dir with a timestamp suffix, remove tmp_dir.
         """
+        # FIX #44: The old code renamed sig files independently of their key
+        # files, producing mismatched names.  For example:
+        #   key:  kyber_priv.bin   -> kyber_priv_20250303_120000.bin
+        #   sig:  kyber_priv.bin.sig -> kyber_priv.bin_20250303_120000.sig  (WRONG)
+        # But _read_and_verify looks for key_path.suffix + ".sig", which
+        # would be kyber_priv_20250303_120000.bin.sig.  The fix: rename key
+        # files first, then rename each .sig to match its key's new name +
+        # ".sig", so _read_and_verify can find the signature.
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        for item in tmp_dir.iterdir():
-            if not item.is_file():
+
+        # First pass: rename non-.sig files, record old->new mapping
+        sig_rename_map = {}  # old_sig_name -> new_sig_name
+        for item in sorted(tmp_dir.iterdir()):
+            if not item.is_file() or item.suffix == ".sig":
                 continue
-            new_name = None
-            if item.suffix == ".sig":
-                # e.g. "kyber_priv.bin.sig"
-                basefile = item.stem  # e.g. "kyber_priv.bin"
-                # "kyber_priv" + ".bin" => we can parse out better, or simpler approach:
-                new_name = f"{basefile}_{stamp}.sig"
+            # e.g. "kyber_priv.bin" -> "kyber_priv_20250303_120000.bin"
+            split_name = item.name.split(".")
+            if len(split_name) > 1:
+                ext = split_name[-1]
+                prefix = ".".join(split_name[:-1])
+                new_name = f"{prefix}_{stamp}.{ext}"
             else:
-                # e.g. "kyber_priv.bin"
-                split_name = item.name.split(".")
-                if len(split_name) > 1:
-                    ext = split_name[-1]
-                    prefix = ".".join(split_name[:-1])
-                    new_name = f"{prefix}_{stamp}.{ext}"
-                else:
-                    # fallback
-                    new_name = f"{item.stem}_{stamp}"
+                new_name = f"{item.stem}_{stamp}"
+            # Record expected sig rename: "kyber_priv.bin.sig" -> "kyber_priv_20250303_120000.bin.sig"
+            old_sig_name = item.name + ".sig"
+            new_sig_name = new_name + ".sig"
+            sig_rename_map[old_sig_name] = new_sig_name
+
             dst = self.keys_dir / new_name
             item.rename(dst)
+
+        # Second pass: rename .sig files to match their key's new name
+        for item in sorted(tmp_dir.iterdir()):
+            if not item.is_file() or item.suffix != ".sig":
+                continue
+            new_sig = sig_rename_map.get(item.name)
+            if new_sig:
+                dst = self.keys_dir / new_sig
+            else:
+                # Fallback: keep original naming pattern
+                dst = self.keys_dir / item.name
+            item.rename(dst)
+
         tmp_dir.rmdir()
 
     def _backup_current_keys(self) -> Path:
@@ -409,12 +435,19 @@ class KeyManager:
 
     def _restore_backup(self, backup_dir: Path) -> None:
         """
-        Remove any new *priv* files, then copy from backup_dir. 
+        Remove any new *priv* files, then copy from backup_dir.
         Then log KEY_ROTATION_REVERTED in chain if present.
         """
-        # remove any new *priv*
+        # FIX #45: The old code deleted ALL files containing "priv" in the
+        # name, including the vendor signing key (vendor_dilithium_priv.bin).
+        # If rotation fails and restore runs, the vendor key would be
+        # deleted and only restored if it happened to be in the backup —
+        # which could be stale.  Now we explicitly skip vendor key files,
+        # which are not part of the rotation cycle and must never be
+        # touched by restore logic.
+        vendor_files = {"vendor_dilithium_priv.bin", "vendor_dilithium_pub.pem"}
         for item in self.keys_dir.iterdir():
-            if item.is_file() and ("priv" in item.name):
+            if item.is_file() and ("priv" in item.name) and (item.name not in vendor_files):
                 item.unlink()
         # restore backups
         for bf in backup_dir.iterdir():

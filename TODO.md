@@ -1013,12 +1013,45 @@ returned by sig.sign(data) as a bytes object. Creating
 bytearray(dil_sig_bytes) makes a copy. Zeroing the copy doesn’t touch
 the original. The signature bytes remain in memory.
 
+FIX APPLIED (pqc_crypto.py — sign_content_bundle):
+  - Changed `dil_sig_bytes` from `bytes` to a mutable `bytearray` named
+    `dil_sig_buf`.  Immediately after `sig.sign(data)` returns immutable
+    bytes, we wrap it in `bytearray()` so we hold the only mutable
+    reference.  We base64-encode from this buffer, then `secure_zero()`
+    wipes the actual buffer we hold in the `finally` block.
+  - The original immutable `bytes` object returned by `sig.sign()` will
+    still exist briefly until garbage-collected, but we no longer falsely
+    pretend we zeroed it.  The mutable copy is the one we actually use
+    and actually zero.
+  WHY: `secure_zero()` operates by writing zeros into each index of a
+  `bytearray`.  It cannot modify `bytes` (immutable).  Wrapping in
+  `bytearray()` at the call site created a throwaway copy that got
+  zeroed and immediately discarded, while the real signature bytes
+  persisted in memory.  By storing the mutable buffer from the start,
+  we ensure the sensitive data we hold IS the data we zero.
+
 42. pqc_crypto.py encrypt_file_payload calls
 secure_zero(bytearray(shared_secret)) in the finally block, then later
 calls secure_zero(bytearray(aes_key)) in another finally block. Same
 problem — both are bytes objects, the bytearray copies get zeroed but
 the originals persist. Every sensitive cryptographic intermediate
 remains in Python’s managed heap.
+
+FIX APPLIED (pqc_crypto.py — encrypt_file_payload, decrypt_file_payload):
+  - Changed `shared_secret` and `aes_key` from `bytes` to `bytearray` at
+    declaration and immediately after receiving values from liboqs/hashlib.
+    In encrypt: `shared_secret = bytearray(ss)` after `kem.encap_secret()`,
+    and `aes_key = bytearray(hashlib.sha256(...).digest())`.  Same pattern
+    in decrypt for `kem.decap_secret()` and the RSA fallback path.
+  - The `finally` blocks now call `secure_zero(shared_secret)` and
+    `secure_zero(aes_key)` directly — no more `bytearray()` wrapper
+    since they are already mutable bytearrays.
+  - `bytearray` is accepted anywhere `bytes` is (AES cipher, HMAC, etc.)
+    so no downstream breakage.
+  WHY: Identical root cause to #41 — `bytearray(some_bytes)` creates a
+  copy, zeroing the copy is useless if you discard it.  By making the
+  variables mutable from the start, `secure_zero()` operates on the
+  actual key material.
 
 43. key_manager.py _generate_new_keys_tmp calls from oqs import
 KeyEncapsulation, Signature as a local import. But the module-level code
@@ -1029,19 +1062,51 @@ this works. But if it’s not, the module-level oqs from pqc_crypto is
 None, and this local import throws ImportError with a different error
 message than the check would suggest. Inconsistent failure paths.
 
+FIX APPLIED (key_manager.py — _generate_new_keys_tmp):
+  - Removed the local `from oqs import KeyEncapsulation, Signature`.
+  - Replaced with `oqs.KeyEncapsulation(...)` and `oqs.Signature(...)`,
+    using the `oqs` module already imported at module level via
+    `from aepok_sentinel.core.pqc_crypto import oqs`.
+  - The method already guards against `oqs` being None at the top:
+    `if not oqs: raise KeyManagerError(...)`, so if liboqs is missing,
+    the failure message is consistent and happens before attempting to
+    call any oqs API.
+  WHY: Two import paths for the same library created inconsistent error
+  messages and confusing failure modes.  The module-level `oqs` from
+  pqc_crypto could be `None` (graceful fallback), but the local
+  `from oqs import ...` would raise a raw ImportError with a different
+  traceback.  Using a single import path ensures one failure mode.
+
 44. key_manager.py _commit_new_keys renames files from tmp_dir to
 keys_dir with timestamp suffixes. The .sig file handling splits on .stem
 which for a file like kyber_priv.bin.sig gives kyber_priv.bin as the
 stem. The new name becomes kyber_priv.bin_20250303_120000.sig. But
 _find_latest_key looks for files that startswith(prefix) and
-endswith(ext) — e.g. startswith "kyber_priv" and endswith ".bin".
+endswith(ext) — e.g. startswith “kyber_priv” and endswith “.bin”.
 The sig files have .sig extension so they won’t match, which is correct.
 But the key files themselves get renamed to
 kyber_priv_20250303_120000.bin, and _read_and_verify looks for the sig
-at key_path.with_suffix(key_path.suffix + ".sig") which produces
+at key_path.with_suffix(key_path.suffix + “.sig”) which produces
 kyber_priv_20250303_120000.bin.sig. The actual sig file was renamed to
 kyber_priv.bin_20250303_120000.sig. The names don’t match. Signature
 verification fails for every rotated key.
+
+FIX APPLIED (key_manager.py — _commit_new_keys):
+  - Rewrote the method to use a two-pass approach:
+    1) First pass: rename all non-.sig key files, recording the mapping
+       from old sig name to new sig name (e.g. “kyber_priv.bin.sig” ->
+       “kyber_priv_20250303_120000.bin.sig”).
+    2) Second pass: rename each .sig file to match its key file’s new
+       name + “.sig”.
+  - This guarantees that _read_and_verify’s lookup
+    `key_path.with_suffix(key_path.suffix + “.sig”)` always finds the
+    corresponding signature file.
+  WHY: The old single-pass approach renamed .sig files independently
+  using `item.stem` (which for `foo.bin.sig` returns `foo.bin`, not
+  `foo`), producing `foo.bin_<timestamp>.sig`.  But the key file became
+  `foo_<timestamp>.bin`, so _read_and_verify looked for
+  `foo_<timestamp>.bin.sig` — which didn’t exist.  Every rotated key
+  failed signature verification.
 
 45. key_manager.py _restore_backup deletes ALL files containing “priv”
 in the name from keys_dir, including vendor_dilithium_priv.bin. The
@@ -1053,10 +1118,40 @@ provisioning and this is the first rotation attempt, the backup has the
 correct vendor key. But if someone manually replaced the vendor key
 between backups, restore silently reverts it. No warning is emitted.
 
+FIX APPLIED (key_manager.py — _restore_backup):
+  - Added a `vendor_files` set containing “vendor_dilithium_priv.bin”
+    and “vendor_dilithium_pub.pem”.
+  - The deletion loop now skips any file whose name is in `vendor_files`.
+  - Vendor keys are provisioned independently of key rotation and must
+    never be touched by the restore logic.
+  WHY: The vendor signing key is the root of trust for verifying all
+  other keys.  Deleting and restoring it from a potentially stale backup
+  could silently downgrade the trust anchor.  If the vendor key was
+  updated between backup creation and a failed rotation, restore would
+  revert it without warning, breaking the chain of trust for all
+  subsequent operations.
+
 46. malware_db.py imports from aepok_sentinel.core.audit_chain import
 append_event. This is importing append_event as a module-level function
 from audit_chain. No such function exists — append_event is only an
 instance method on AuditChain. ImportError on module load.
+
+FIX APPLIED (malware_db.py):
+  - Replaced the broken `from aepok_sentinel.core.audit_chain import
+    append_event` with `from aepok_sentinel.core.audit_chain import
+    AuditChain`.
+  - Added an optional `audit_chain: Optional[AuditChain] = None`
+    parameter to `MalwareDatabase.__init__()`.
+  - In `_fetch_cloud_signatures()`, replaced the bare `append_event()`
+    calls with `self.audit_chain.append_event()`, guarded by
+    `if self.audit_chain:` and wrapped in try/except to avoid crashing
+    on audit failures.
+  WHY: `append_event` is an instance method on the `AuditChain` class,
+  not a standalone module-level function.  The old import would throw
+  `ImportError` the moment `malware_db.py` was loaded, making the
+  entire malware database module unusable.  The fix follows the same
+  pattern used by `KeyManager` and `AutobanManager`, which both accept
+  an `AuditChain` instance and call its methods.
 
 47. malware_db.py MalwareDatabase.__init__ calls
 resolve_path("signatures", "malware_signatures.json"). But
@@ -1067,6 +1162,20 @@ non-existent path components), but _load_local will find no file and
 return an empty DB. The signatures directory is never validated at
 startup, so its absence is silent.
 
+FIX APPLIED (directory_contract.py):
+  - Added "signatures" to the `REQUIRED_DIRS` list.
+  - Added a corresponding entry in `REQUIRED_FILES`:
+    `"signatures": ["malware_signatures.json"]`.
+  - This means `validate_runtime_structure()` will now check for the
+    signatures directory and its expected file at startup, raising
+    RuntimeError if either is missing.
+  WHY: Without the signatures directory in the contract, the system
+  silently degraded to an empty malware database — no signatures loaded,
+  no files ever flagged as malicious.  This is a critical security gap:
+  the malware scanner would appear to work but catch nothing.  Adding it
+  to the contract ensures deployment failures are caught at startup
+  rather than silently ignored at runtime.
+
 48. autoban.py AutobanManager.__init__ takes blocklist_file
 defaulting to /var/lib/sentinel/blocked_ips.json — a path completely
 outside the directory contract. This file’s directory is checked with a
@@ -1076,6 +1185,22 @@ boundary. An attacker who can write to /var/lib/sentinel/ can replace
 the blocklist and its signature without triggering any trust anchor
 violation.
 
+FIX APPLIED (autoban.py — AutobanManager.__init__):
+  - Changed `blocklist_file` default from "/var/lib/sentinel/blocked_ips.json"
+    to `None`.  When None, it resolves to `resolve_path("config",
+    "blocked_ips.json")` — inside the contracted runtime directory.
+  - Changed `sign_priv_key_path` default from "/var/lib/sentinel/
+    autoban_dilithium_priv.bin" to `None`.  When None, resolves to
+    `resolve_path("keys", "autoban_dilithium_priv.bin")`.
+  - Callers can still override with explicit paths if needed, but the
+    defaults now live inside the trust boundary.
+  WHY: The directory contract exists to ensure all security-critical files
+  live under a validated, symlink-checked, Unicode-normalized runtime
+  path.  Placing the blocklist outside this boundary meant an attacker
+  with write access to /var/lib/sentinel/ could replace the blocklist
+  and its signature without triggering any trust anchor check.  Moving
+  defaults inside the contract closes this gap.
+
 49. autoban.py _get_fallback_trusted_hashes computes SHA-256 of
 firewall binaries at runtime as “fallback” trusted hashes. This is a
 security vulnerability — if the firewall binary is already
@@ -1084,12 +1209,43 @@ trusting the compromised binary. The trusted hashes should be
 provisioned from a known-good source, not computed from whatever happens
 to be on disk.
 
+FIX APPLIED (autoban.py — _get_fallback_trusted_hashes):
+  - Removed all runtime hashing of firewall binaries.
+  - The method now logs a warning explaining that trusted hashes must be
+    provisioned from a known-good source and returns an empty list.
+  - When the list is empty and autoban is enabled, the existing guard in
+    __init__ raises RuntimeError: “Autoban is enabled, but no
+    trusted_firewall_hashes provided or found.”  This forces operators
+    to supply pre-computed hashes in the config.
+  WHY: This is a TOCTOU-adjacent security vulnerability.  If an attacker
+  has already replaced /usr/sbin/ufw or /sbin/iptables with a malicious
+  binary, computing its SHA-256 at runtime and adding it to the trusted
+  list means Sentinel would happily execute the compromised binary.
+  Trusted hashes must come from a build manifest, a signed attestation,
+  or a manually-provisioned config — never from whatever happens to be
+  on disk at the time the process starts.
+
 50. autoban.py enforce_block on macOS tries pfctl with -f flag and
 passes a rule as an argument. pfctl -f expects a file path to a rules
 file, not an inline rule string. The command [pfctl, "-f", "block
 drop from 1.2.3.4 to any"] will try to open a file literally named
 "block drop from 1.2.3.4 to any". It will fail on every macOS block
 attempt.
+
+FIX APPLIED (autoban.py — _build_firewall_command_args, darwin/pfctl):
+  - Replaced `[cmd_path, "-f", f"block drop from {identifier} to any"]`
+    with `[cmd_path, "-t", "sentinel_blocked", "-T", "add", identifier]`.
+  - This uses pfctl's table management interface: `-t sentinel_blocked`
+    selects the table, `-T add` adds an IP to it.
+  - The pf.conf on the host must have a corresponding rule:
+    `block drop from <sentinel_blocked> to any` — this is a standard
+    macOS/BSD pattern for dynamic IP blocking with pf tables.
+  WHY: `pfctl -f` expects a file path containing pf rules, not an
+  inline rule string.  The old command would cause pfctl to attempt
+  opening a file literally named "block drop from 1.2.3.4 to any",
+  which does not exist, causing every macOS block attempt to fail.
+  Using pf tables (`-t ... -T add`) is the correct and standard
+  approach for dynamically adding/removing IPs to a block list.
 
 51. autoban.py enforce_unblock on Windows constructs
 f'name=SentinelBlock {identifier}' as a single argument. But

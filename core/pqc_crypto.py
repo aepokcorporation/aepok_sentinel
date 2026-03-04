@@ -135,19 +135,26 @@ def encrypt_file_payload(
     # For encapsulation we do NOT need a secret key — we only need the
     # public key, which is passed to kem.encap_secret(kyber_pub).  The
     # constructor should be called with the algorithm name only.
-    aes_key = b""
+    # FIX #42: shared_secret and aes_key are returned as immutable `bytes`.
+    # The old code called secure_zero(bytearray(shared_secret)) which only
+    # zeroed a copy, leaving the original in memory.  Now we immediately
+    # copy into mutable bytearrays so secure_zero operates on the actual
+    # buffer we hold.  Same fix applied to aes_key further below.
+    aes_key = bytearray()
     wrapped_kyber = b""
-    shared_secret = b""
+    shared_secret = bytearray()
     try:
         with oqs.KeyEncapsulation("Kyber512") as kem:
-            wrapped_kyber, shared_secret = kem.encap_secret(kyber_pub)
-        aes_key = hashlib.sha256(shared_secret).digest()
+            wk, ss = kem.encap_secret(kyber_pub)
+            wrapped_kyber = wk
+            shared_secret = bytearray(ss)
+        aes_key = bytearray(hashlib.sha256(bytes(shared_secret)).digest())
     except Exception as e:
         logger.error("Kyber encryption failed: %s", e)
         raise CryptoDecryptionError(f"Kyber encryption failed: {e}")
     finally:
         if shared_secret:
-            secure_zero(bytearray(shared_secret))
+            secure_zero(shared_secret)
 
     # 2) Optional RSA fallback if not in strict/hardened
     wrapped_rsa = b""
@@ -201,7 +208,7 @@ def encrypt_file_payload(
         raise CryptoDecryptionError(f"AES encryption failed: {e}")
     finally:
         if aes_key:
-            secure_zero(bytearray(aes_key))
+            secure_zero(aes_key)  # FIX #42: aes_key is already a bytearray
 
     payload = {
         "version": 1,
@@ -257,8 +264,10 @@ def decrypt_file_payload(
 
     integrity_hex = payload.get("integrity", "")
 
-    aes_key = b""
-    shared_secret = b""
+    # FIX #42 (applied to decrypt path as well): use mutable bytearrays
+    # so secure_zero actually wipes the key material we hold.
+    aes_key = bytearray()
+    shared_secret = bytearray()
     kyber_failed = False
 
     # 1) Kyber decapsulation
@@ -275,14 +284,14 @@ def decrypt_file_payload(
     # (decapsulation requires the secret key to unwrap).
     try:
         with oqs.KeyEncapsulation("Kyber512", kyber_priv) as kem:
-            shared_secret = kem.decap_secret(wrapped_kyber)
-        aes_key = hashlib.sha256(shared_secret).digest()
+            shared_secret = bytearray(kem.decap_secret(wrapped_kyber))
+        aes_key = bytearray(hashlib.sha256(bytes(shared_secret)).digest())
     except Exception as e:
         logger.warning("Kyber decapsulation failed: %s", e)
         kyber_failed = True
     finally:
         if shared_secret:
-            secure_zero(bytearray(shared_secret))
+            secure_zero(shared_secret)
 
     # 2) RSA fallback if allowed
     fallback_allowed = False
@@ -296,14 +305,14 @@ def decrypt_file_payload(
         logger.info("Attempting RSA fallback.")
         try:
             rsa_private_key = _load_rsa_private_key(rsa_priv)
-            aes_key = rsa_private_key.decrypt(
+            aes_key = bytearray(rsa_private_key.decrypt(
                 wrapped_rsa,
                 asym_padding.OAEP(
                     mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
                     algorithm=hashes.SHA256(),
                     label=None
                 )
-            )
+            ))
             # Emit SIGNATURE_RSA_USED as a fallback marker
             try:
                 from aepok_sentinel.core.audit_chain import append_event
@@ -355,7 +364,7 @@ def decrypt_file_payload(
         raise CryptoDecryptionError(f"Decryption or integrity check failed => {e}")
     finally:
         if aes_key:
-            secure_zero(bytearray(aes_key))
+            secure_zero(aes_key)  # FIX #42: aes_key is already a bytearray
 
     return plaintext
 
@@ -385,18 +394,26 @@ def sign_content_bundle(
     validate_rng()
 
     # Dilithium sign
-    dil_sig_bytes = b""
+    #
+    # FIX #41: sig.sign() returns immutable `bytes`. The old code called
+    # secure_zero(bytearray(dil_sig_bytes)) which created a *copy* of the
+    # signature bytes, zeroed the copy, and left the original untouched in
+    # memory.  Now we immediately copy into a mutable bytearray, base64-
+    # encode from it, then zero the bytearray so the raw signature bytes
+    # are wiped.  The original `bytes` object returned by sign() will be
+    # garbage-collected, but we no longer pretend it was zeroed.
+    dil_sig_buf = bytearray()
     dil_sign_b64 = ""
     try:
         with oqs.Signature("Dilithium2", dil_priv) as sig:
-            dil_sig_bytes = sig.sign(data)
-        dil_sign_b64 = base64.b64encode(dil_sig_bytes).decode("utf-8")
+            dil_sig_buf = bytearray(sig.sign(data))
+        dil_sign_b64 = base64.b64encode(bytes(dil_sig_buf)).decode("utf-8")
     except Exception as e:
         logger.error("Dilithium sign failed: %s", e)
         raise CryptoSignatureError(e)
     finally:
-        if dil_sig_bytes:
-            secure_zero(bytearray(dil_sig_bytes))
+        if dil_sig_buf:
+            secure_zero(dil_sig_buf)
 
     # RSA sign fallback if allowed
     rsa_sign_b64 = ""

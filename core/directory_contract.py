@@ -42,6 +42,13 @@ REQUIRED_DIRS: List[str] = [
     "config",
     "keys",
     "license",
+    # FIX #47: malware_db.py resolves paths under "signatures" via
+    # resolve_path("signatures", "malware_signatures.json"), but the
+    # directory was missing from the contract.  Without it, the directory
+    # is never validated at startup, so its absence is silent and
+    # _load_local() quietly returns an empty DB.  Adding it here ensures
+    # the directory is validated at startup just like config/keys/license.
+    "signatures",
 ]
 
 REQUIRED_FILES = {
@@ -56,6 +63,9 @@ REQUIRED_FILES = {
     ],
     "license": [
         "license.key",
+    ],
+    "signatures": [
+        "malware_signatures.json",
     ],
 }
 
