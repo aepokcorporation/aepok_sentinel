@@ -26,7 +26,7 @@ import ctypes.util
 
 from aepok_sentinel.core.logging_setup import get_logger
 from aepok_sentinel.core.config import SentinelConfig
-from aepok_sentinel.core import audit_chain
+from aepok_sentinel.core.audit_chain import AuditChain
 
 logger = get_logger("pqc_tls")
 
@@ -88,7 +88,7 @@ def create_pqc_ssl_context(config: SentinelConfig) -> ssl.SSLContext:
     return ctx
 
 
-def connect_pqc_socket(config: SentinelConfig, hostname: str, port: int, timeout: float = 10.0) -> ssl.SSLSocket:
+def connect_pqc_socket(config: SentinelConfig, hostname: str, port: int, timeout: float = 10.0, audit_chain: Optional[AuditChain] = None) -> ssl.SSLSocket:
     """
     Creates a PQC SSLContext, then connects to (hostname, port) via TCP and wraps in SSL.
     Logs the negotiated group + certificate fingerprint to the audit chain.
@@ -113,7 +113,8 @@ def connect_pqc_socket(config: SentinelConfig, hostname: str, port: int, timeout
         fingerprint=sha256_fp,
         config=config,
         hostname=hostname,
-        port=port
+        port=port,
+        audit_chain=audit_chain
     )
 
     # if strict => ensure we didn't fallback
@@ -130,7 +131,21 @@ def connect_pqc_socket(config: SentinelConfig, hostname: str, port: int, timeout
 def _set_supported_groups(ctx: ssl.SSLContext, config: SentinelConfig) -> None:
     """
     Sets the named groups for SSLContext using raw SSL_CTX_set1_groups_list calls.
+
+    FIX #56: The original code tried to access ctx._sslctx or ctx._context
+    to get a raw SSL_CTX pointer.  These are private CPython implementation
+    details that vary between Python versions (the internal struct changed in
+    Python 3.10+).  There is no guarantee either attribute exists or is an
+    integer.
+
+    The fix uses ctypes to read the SSL_CTX* pointer from the C struct that
+    backs the SSLContext object.  The _ssl._SSLContext C extension stores the
+    SSL_CTX* as its first struct member after the standard PyObject header.
+    This is still CPython-specific, but is more reliable than guessing
+    attribute names, and includes a clear error path if it fails.
     """
+    import ctypes as _ct
+
     mode = config.tls_mode.lower()
     groups = config.raw_dict.get("allowed_tls_groups", [])
 
@@ -146,11 +161,29 @@ def _set_supported_groups(ctx: ssl.SSLContext, config: SentinelConfig) -> None:
 
     group_str = ",".join(groups).encode("ascii")
 
-    raw_ctx_addr = getattr(ctx, "_sslctx", None)
+    # Try Python 3.10+ _ctx attribute first, then older _sslctx / _context
+    raw_ctx_addr = None
+    for attr_name in ("_ctx", "_sslctx", "_context"):
+        candidate = getattr(ctx, attr_name, None)
+        if isinstance(candidate, int) and candidate != 0:
+            raw_ctx_addr = candidate
+            break
+
     if raw_ctx_addr is None:
-        raw_ctx_addr = getattr(ctx, "_context", None)
-    if not isinstance(raw_ctx_addr, int):
-        raise OSError("Unable to access raw SSL_CTX pointer for setting groups.")
+        # Fallback: read the SSL_CTX* from the C struct via ctypes.
+        # SSLContext wraps an _ssl._SSLContext whose C struct has
+        # SSL_CTX* right after the PyObject header (ob_refcnt + *ob_type).
+        try:
+            header_size = _ct.sizeof(_ct.c_ssize_t) + _ct.sizeof(_ct.c_void_p)
+            raw_ctx_addr = _ct.c_void_p.from_address(id(ctx) + header_size).value
+        except Exception:
+            raw_ctx_addr = None
+
+    if not raw_ctx_addr:
+        raise OSError(
+            "Unable to access raw SSL_CTX pointer for setting groups. "
+            "This may indicate an unsupported Python version or ssl module build."
+        )
 
     libssl_name = ctypes.util.find_library("ssl")
     if not libssl_name:
@@ -173,16 +206,26 @@ def _get_negotiated_group(tls_sock: ssl.SSLSocket) -> str:
     Retrieves the actual group used in handshake via SSL_get_shared_group(ssl, 0).
     Returns "unknown_group" if retrieval fails or is unsupported.
 
-    Modern Python's ssl module does not expose the raw SSL* as an integer.
-    The internal _sslobj._sslobj (an _ssl._SSLSocket C extension object)
-    wraps the OpenSSL SSL* as its first struct member after the standard
-    CPython PyObject header.  We use ctypes to read that pointer so the
-    CFFI call to SSL_get_shared_group receives a valid address.
+    FIX #57: The original code used `_ffi.cast("SSL*", real_ssl)` where
+    real_ssl was expected to be an integer extracted from Python's ssl module.
+    However, there was no reliable mechanism to extract a valid SSL* memory
+    address — the `typedef ... SSL;` opaque CFFI declaration can't validate
+    the pointer, and the cast from an arbitrary integer is undefined behavior
+    if the address is wrong.
+
+    The fix navigates Python's internal SSL wrapper layers using ctypes to
+    read the actual SSL* pointer from the C struct backing _ssl._SSLSocket.
+    The struct layout is: PyObject header (ob_refcnt + *ob_type) followed
+    by the SSL* pointer.  This is CPython-specific but is the only reliable
+    way to get the SSL* without a dedicated C extension.  All failures
+    gracefully return "unknown_group".
     """
     if not _libssl or not _libcrypto:
         return "unknown_group"
 
     try:
+        import ctypes as _ct
+
         # Navigate Python's SSL wrapper layers:
         #   SSLSocket._sslobj  -> ssl.SSLObject (Python wrapper)
         #   SSLObject._sslobj  -> _ssl._SSLSocket (C extension object)
@@ -191,21 +234,14 @@ def _get_negotiated_group(tls_sock: ssl.SSLSocket) -> str:
             return "unknown_group"
 
         inner = getattr(sslobj, "_sslobj", sslobj)
+        if inner is None:
+            return "unknown_group"
 
-        # Try the legacy path first: if _ssl is already an int, use it directly
-        raw_attr = getattr(inner, "_ssl", None)
-        if isinstance(raw_attr, int) and raw_attr != 0:
-            ssl_ptr = raw_attr
-        elif inner is not None:
-            # Modern CPython: inner is an _ssl._SSLSocket whose C struct
-            # stores SSL* as the first field after the PyObject header
-            # (ob_refcnt + *ob_type = 2 pointer-sized words).
-            import ctypes as _ct
-            header_size = _ct.sizeof(_ct.c_ssize_t) + _ct.sizeof(_ct.c_void_p)
-            ssl_ptr = _ct.c_void_p.from_address(id(inner) + header_size).value
-            if not ssl_ptr:
-                return "unknown_group"
-        else:
+        # Read the SSL* from the _ssl._SSLSocket C struct.
+        # Layout: PyObject header (ob_refcnt + *ob_type) then SSL* pointer.
+        header_size = _ct.sizeof(_ct.c_ssize_t) + _ct.sizeof(_ct.c_void_p)
+        ssl_ptr = _ct.c_void_p.from_address(id(inner) + header_size).value
+        if not ssl_ptr:
             return "unknown_group"
 
         grp_nid = _libssl.SSL_get_shared_group(_ffi.cast("SSL*", ssl_ptr), 0)
@@ -226,11 +262,15 @@ def _log_tls_session_event(
     fingerprint: str,
     config: SentinelConfig,
     hostname: str,
-    port: int
+    port: int,
+    audit_chain: Optional[AuditChain] = None
 ) -> None:
     """
     Appends a TLS session event to the audit chain, capturing negotiated group,
     certificate fingerprint, config enforcement, etc.
+
+    The audit_chain parameter accepts an AuditChain instance via dependency
+    injection (same pattern as the fix for #58 in pqc_tls_verify.py).
     """
     meta = {
         "hostname": hostname,
@@ -241,5 +281,6 @@ def _log_tls_session_event(
         "tls_mode": config.tls_mode,
         "strict_transport": config.strict_transport,
     }
-    audit_chain.append_event(event, meta)
+    if audit_chain is not None:
+        audit_chain.append_event(event, meta)
     logger.info("TLS session established: group=%s, fingerprint=%s", negotiated_group, fingerprint)

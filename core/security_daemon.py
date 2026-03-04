@@ -65,17 +65,24 @@ class SecurityDaemon:
         config: SentinelConfig,
         license_mgr: LicenseManager,
         audit_chain: AuditChain,
-        hash_store_path: Path = resolve_path("security", ".hashes.json"),
-        quarantine_dir: Path = resolve_path("quarantine"),
-        sign_priv_key_path: Path = resolve_path("security", "daemon_dilithium_priv.bin"),
+        # FIX #52: Default parameter values are evaluated once at class
+        # definition time, not at instantiation time.  If resolve_path()
+        # fails during module import (e.g. runtime directory doesn't exist
+        # yet), the class definition itself crashes.  Using None as the
+        # default and resolving inside __init__ defers the call to
+        # instantiation time, when the runtime directory is guaranteed to
+        # exist.
+        hash_store_path: Optional[Path] = None,
+        quarantine_dir: Optional[Path] = None,
+        sign_priv_key_path: Optional[Path] = None,
         autoban_mgr: Optional[AutobanManager] = None
     ):
         self.config = config
         self.license_mgr = license_mgr
         self.audit_chain = audit_chain
-        self.hash_store_path = hash_store_path
-        self.quarantine_dir = quarantine_dir
-        self.sign_priv_key_path = sign_priv_key_path
+        self.hash_store_path = hash_store_path if hash_store_path is not None else resolve_path("security", ".hashes.json")
+        self.quarantine_dir = quarantine_dir if quarantine_dir is not None else resolve_path("quarantine")
+        self.sign_priv_key_path = sign_priv_key_path if sign_priv_key_path is not None else resolve_path("security", "daemon_dilithium_priv.bin")
         self.autoban_mgr = autoban_mgr
 
         if not self.quarantine_dir.is_dir():
@@ -181,21 +188,34 @@ class SecurityDaemon:
         inotify = INotify()
         watch_flags = flags.CREATE | flags.MODIFY | flags.MOVED_TO
 
+        # FIX #53: inotify_simple's INotify object does NOT maintain a
+        # .watches dict mapping watch descriptors to paths.  The caller is
+        # responsible for tracking that mapping.  Without it, the original
+        # code threw AttributeError on the first event, making the entire
+        # inotify code path non-functional.  We now maintain a wd->path
+        # dict ourselves.
+        wd_to_path: Dict[int, str] = {}
+
         for p in self.config.scan_paths:
             if os.path.isdir(p):
                 wd = inotify.add_watch(p, watch_flags)
+                wd_to_path[wd] = p
                 if self.config.scan_recursive:
                     for root, dirs, _ in os.walk(p):
                         for d in dirs:
                             subdir = os.path.join(root, d)
-                            inotify.add_watch(subdir, watch_flags)
+                            sub_wd = inotify.add_watch(subdir, watch_flags)
+                            wd_to_path[sub_wd] = subdir
 
         while not self._stop_flag.is_set():
             events = inotify.read(timeout=1000)
             if not events:
                 continue
             for e in events:
-                watch_path = inotify.watches[e.wd].path
+                watch_path = wd_to_path.get(e.wd)
+                if watch_path is None:
+                    logger.warning("Received inotify event for unknown watch descriptor %d", e.wd)
+                    continue
                 full_path = os.path.join(watch_path, e.name)
                 if not os.path.isfile(full_path):
                     continue
@@ -262,7 +282,12 @@ class SecurityDaemon:
         else:
             self._update_file_hash(filepath)
 
-    def _analyze_file(self, filepath: str) -> (bool, Optional[str], Dict[str, Any]):
+    # FIX #54: The original return type annotation used bare parenthesized
+    # types `-> (bool, Optional[str], Dict[str, Any])` which Python
+    # interprets as a tuple expression, not a proper type annotation.
+    # Static type checkers and IDE tooling can't validate the return type.
+    # Changed to `tuple[...]` (Python 3.9+ built-in generic syntax).
+    def _analyze_file(self, filepath: str) -> tuple[bool, Optional[str], Dict[str, Any]]:
         new_hash = self._compute_sha256(filepath)
         old_hash = self._hash_store.get(filepath)
         metadata = {"file": filepath, "new_hash": new_hash}
@@ -355,6 +380,13 @@ class SecurityDaemon:
         self._save_hash_store()
 
     def _get_intrusion_source_for_file(self, filepath: str) -> Optional[Dict[str, str]]:
+        # FIX #55: The original fallback else branch returned an intrusion
+        # source for EVERY file, treating arbitrary filenames as IP addresses.
+        # This meant every scanned file — even benign ones — got tagged with
+        # an "intrusion source" of ip:<filename>.  If autoban was enabled,
+        # every file update would attempt to ban its own filename as an IP.
+        # The fix removes the fallback branch and returns None when the
+        # filename doesn't match any known intrusion-source prefix pattern.
         base = os.path.basename(filepath).lower()
         if base.startswith("usb_"):
             return {"type": "usb", "value": f"usb:{base}"}
@@ -367,8 +399,8 @@ class SecurityDaemon:
         elif base.startswith("proc_"):
             return {"type": "process", "value": f"proc:{base}"}
         else:
-            # fallback => treat as IP
-            return {"type": "ip", "value": f"{base}"}
+            # No recognized intrusion-source prefix — this is a normal file.
+            return None
 
     def _excluded_path(self, path: str, excludes: list) -> bool:
         for e in excludes:

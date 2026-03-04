@@ -220,7 +220,18 @@ class AutobanManager:
             else:
                 raise AutobanError("No valid/trusted firewall binary for unblocking on Linux.")
         elif platform_str.startswith("win"):
-            cmd = ["netsh", "advfirewall", "firewall", "delete", "rule", f'name=SentinelBlock {identifier}']
+            # FIX #51: netsh expects "name=..." as a single token with no space
+            # separation between the key and value.  The f-string already produces
+            # a single element, but we also need to resolve the binary path through
+            # the trust-check path (same as enforce_block) instead of hard-coding
+            # "netsh".  Additionally, align the argument format with
+            # _build_firewall_command_args so both block/unblock are consistent.
+            netsh_path = which("netsh")
+            if netsh_path and self._verify_binary_trusted(netsh_path):
+                cmd = [netsh_path, "advfirewall", "firewall", "delete", "rule",
+                       f"name=SentinelBlock {identifier}"]
+            else:
+                raise AutobanError("No valid/trusted netsh binary for unblocking on Windows.")
         elif platform_str.startswith("darwin"):
             ipfw_path = which("ipfw")
             if ipfw_path and self._verify_binary_trusted(ipfw_path):
