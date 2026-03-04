@@ -230,12 +230,27 @@ class SentinelConfig:
 
     def _validate_coherence(self) -> None:
         """
-        Catch contradictory settings. Example:
+        Catch contradictory settings. Examples:
           - strict_transport=True + allow_classical_fallback=True => contradiction.
+          - strict_transport=True + tls_mode=classical => contradiction.
+
+        FIX #59: The original check only caught strict_transport +
+        allow_classical_fallback.  But strict_transport=True with
+        tls_mode="classical" (and allow_classical_fallback=False) was not
+        caught.  This combination silently killed ALL TLS connections because
+        verify_negotiated_pqc() would reject every session: classical mode
+        with strict_transport returns False unconditionally.  Adding the
+        second check here surfaces the contradiction at config load time
+        rather than at runtime connection failure.
         """
         if self.strict_transport and self.allow_classical_fallback:
             raise ConfigError(
                 "Incoherent config: strict_transport=True but allow_classical_fallback=True."
+            )
+        if self.strict_transport and getattr(self, "tls_mode", "").lower() == "classical":
+            raise ConfigError(
+                "Incoherent config: strict_transport=True but tls_mode=classical. "
+                "Strict transport requires PQC or hybrid TLS mode."
             )
 
 

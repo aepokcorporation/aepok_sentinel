@@ -23,7 +23,6 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from typing import Optional
 
-from aepok_sentinel.core import audit_chain
 from aepok_sentinel.core.directory_contract import resolve_path
 
 
@@ -81,8 +80,20 @@ class LockingRotatingFileHandler(RotatingFileHandler):
             self._unlock_file(self.stream)
 
     def doRollover(self):
-        if self.stream:
-            self._lock_file(self.stream)
+        # FIX #60: The original code locked self.stream before calling
+        # super().doRollover(), which closes and reopens self.stream.
+        # The finally block then called _unlock_file(self.stream) on the
+        # NEW stream — which was never locked.  On Windows with
+        # msvcrt.locking, unlocking an unlocked file throws an error.
+        #
+        # The fix captures the old stream before rollover so we can
+        # unlock the correct file descriptor in the finally block.
+        # We also removed the audit_chain.append_event() call which had
+        # the same module-level function bug as TODO #2, and could cause
+        # reentrant logging during rollover.
+        old_stream = self.stream
+        if old_stream:
+            self._lock_file(old_stream)
         try:
             super().doRollover()
 
@@ -101,15 +112,14 @@ class LockingRotatingFileHandler(RotatingFileHandler):
                     f.write(json.dumps(event) + "\n")
                 finally:
                     self._unlock_file(f)
-
-            # Also record an audit_chain event for log rotation
-            audit_chain.append_event(
-                event="LOG_ROTATED",
-                metadata={"logfile": new_log_path}
-            )
         finally:
-            if self.stream:
-                self._unlock_file(self.stream)
+            # Unlock the OLD stream (the one we actually locked), not
+            # self.stream which now points to the new, never-locked file.
+            if old_stream:
+                try:
+                    self._unlock_file(old_stream)
+                except Exception:
+                    pass  # Old stream may already be closed; safe to ignore
 
     @staticmethod
     def _lock_file(file_obj):

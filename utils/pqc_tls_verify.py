@@ -25,7 +25,7 @@ from typing import Optional
 
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.pqc_tls import _get_negotiated_group
-from aepok_sentinel.core import audit_chain
+from aepok_sentinel.core.audit_chain import AuditChain
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +129,7 @@ def check_session_resumption(tls_sock: ssl.SSLSocket) -> bool:
 def log_tls_verification_event(
     tls_sock: ssl.SSLSocket,
     config: SentinelConfig,
+    audit_chain: AuditChain,
     event: str = "TLS_VERIFICATION"
 ) -> None:
     """
@@ -137,6 +138,15 @@ def log_tls_verification_event(
       - certificate fingerprint
       - enforcement and PQC mode
       - session resumption info
+
+    FIX #58: The original code called `audit_chain.append_event(event, metadata)`
+    where `audit_chain` was imported as a *module*, not an instance.  The
+    audit_chain module has no module-level `append_event` function — that
+    method only exists on the AuditChain class.  This is the same bug as
+    TODO #2.  The fix requires the caller to pass an AuditChain instance
+    explicitly, matching the pattern used in other modules (autoban,
+    security_daemon) that correctly receive the audit chain via dependency
+    injection.
     """
     group_name = _get_negotiated_group(tls_sock) or "unknown_group"
     fingerprint = get_server_cert_fingerprint(tls_sock)

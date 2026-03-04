@@ -1248,22 +1248,58 @@ FIX APPLIED (autoban.py — _build_firewall_command_args, darwin/pfctl):
   approach for dynamically adding/removing IPs to a block list.
 
 51. autoban.py enforce_unblock on Windows constructs
-f'name=SentinelBlock {identifier}' as a single argument. But
+f’name=SentinelBlock {identifier}’ as a single argument. But
 subprocess.run with a list splits arguments. The netsh command expects
 name= as its own token. This may or may not work depending on how netsh
 parses compound arguments — but it’s inconsistent with how
-enforce_block constructs the same command, where f"name=SentinelBlock
-{identifier}" is also a single element. The inconsistency suggests
+enforce_block constructs the same command, where f”name=SentinelBlock
+{identifier}” is also a single element. The inconsistency suggests
 neither was tested.
 
-52. security_daemon.py __init__ uses resolve_path("security",
-".hashes.json") and resolve_path("quarantine") and
-resolve_path("security", "daemon_dilithium_priv.bin") as default
+FIX APPLIED (autoban.py — enforce_unblock):
+  - The Windows branch in enforce_unblock hard-coded “netsh” as the binary
+    name instead of resolving and trust-checking it through `which()` +
+    `_verify_binary_trusted()` like enforce_block does.  This was both
+    inconsistent and a security gap — it bypassed the trusted-binary hash
+    verification that protects against running a compromised firewall binary.
+  - Changed the Windows branch to resolve netsh via `which(“netsh”)` and
+    run it through `_verify_binary_trusted()` before using it, matching the
+    pattern in enforce_block and the Linux/macOS branches of enforce_unblock.
+  - If no trusted netsh binary is found, we now raise AutobanError (same as
+    the Linux and macOS branches) instead of blindly executing an unverified
+    binary.
+  - The `name=SentinelBlock {identifier}` f-string format is kept as a
+    single list element, which is correct for subprocess.run with a list:
+    netsh expects “name=SentinelBlock <ip>” as one token.
+  WHY: Consistency with enforce_block and binary trust verification are both
+  required to maintain the security invariant that only hash-verified
+  firewall binaries are executed.  The original code silently bypassed this.
+
+52. security_daemon.py __init__ uses resolve_path(“security”,
+“.hashes.json”) and resolve_path(“quarantine”) and
+resolve_path(“security”, “daemon_dilithium_priv.bin”) as default
 parameter values. Default parameter values are evaluated at class
 definition time, not at instantiation time. If resolve_path fails during
 module import (e.g., because the runtime directory doesn’t exist yet),
 the class definition itself crashes and the module can’t be imported at
 all.
+
+FIX APPLIED (security_daemon.py — __init__ default parameters):
+  - Changed all three default parameter values from `resolve_path(...)`
+    calls to `None`.
+  - Added conditional resolution inside __init__: if the parameter is None,
+    resolve_path() is called at instantiation time, not at class definition
+    time.
+  - This means the module can be imported even if the runtime directory
+    doesn’t exist yet.  The resolve_path() call only happens when someone
+    actually creates a SecurityDaemon instance, at which point the runtime
+    directory is expected to exist.
+  WHY: Python evaluates default parameter values once at function/class
+  definition time (i.e., during module import).  If resolve_path() fails
+  at import time — because the runtime directory hasn’t been created yet,
+  or the test harness hasn’t initialized the directory contract — the
+  entire module becomes unimportable.  The standard Python pattern for
+  mutable/callable defaults is to use None and resolve inside the body.
 
 53. security_daemon.py _run_inotify_loop accesses
 inotify.watches[e.wd].path. The inotify_simple library’s INotify
@@ -1271,6 +1307,24 @@ object doesn’t have a .watches dict attribute. Watch descriptors and
 paths aren’t tracked by the library — the caller is responsible for
 maintaining a mapping. This throws AttributeError on the first inotify
 event. The inotify code path is completely non-functional.
+
+FIX APPLIED (security_daemon.py — _run_inotify_loop):
+  - Added a `wd_to_path: Dict[int, str]` dictionary that maps watch
+    descriptors to their corresponding directory paths.
+  - Populated wd_to_path during the initial add_watch loop, storing the
+    return value from inotify.add_watch() as the key and the directory
+    path as the value.
+  - Replaced `inotify.watches[e.wd].path` with `wd_to_path.get(e.wd)`,
+    which looks up the path from our own mapping.
+  - Added a guard for unknown watch descriptors (logs a warning and skips
+    the event) in case a watch was removed or the descriptor is stale.
+  WHY: inotify_simple is a minimal wrapper around the Linux inotify API.
+  It returns watch descriptors as integers from add_watch() but does NOT
+  maintain any internal mapping from descriptors to paths.  The original
+  code assumed a .watches dict existed on the INotify object, causing
+  AttributeError on the very first event.  The caller must maintain its
+  own wd-to-path mapping, which is the standard pattern shown in
+  inotify_simple’s own documentation.
 
 54. security_daemon.py _analyze_file return type annotation says
 (bool, Optional[str], Dict[str, Any]) but uses the legacy tuple
@@ -1280,13 +1334,45 @@ tuple expression, not a type annotation. This doesn’t cause a runtime
 error but it means static type checkers and IDE tooling can’t validate
 the return types.
 
+FIX APPLIED (security_daemon.py — _analyze_file return type):
+  - Changed `-> (bool, Optional[str], Dict[str, Any])` to
+    `-> tuple[bool, Optional[str], Dict[str, Any]]`.
+  - The `tuple[...]` syntax is the built-in generic form available since
+    Python 3.9 (PEP 585), which is the minimum version this project
+    targets.
+  WHY: The parenthesized form `(bool, Optional[str], Dict[str, Any])`
+  is parsed by Python as a tuple expression containing three type objects.
+  It is NOT a type annotation — it’s just a runtime tuple value that
+  happens to contain types.  Static type checkers (mypy, pyright) and
+  IDE tooling cannot interpret it as a return type, so they can’t validate
+  that the function actually returns the documented types.  Using
+  `tuple[...]` makes it a proper generic type annotation.
+
 55. security_daemon.py _get_intrusion_source_for_file returns an
 intrusion source for EVERY file. The fallback else branch returns
-{"type": "ip", "value": f"{base}"} for any filename that doesn’t
+{“type”: “ip”, “value”: f”{base}”} for any filename that doesn’t
 match the prefixes. This means every file that’s scanned — even benign
 ones — gets tagged with an “intrusion source” of ip:<filename>. If
 autoban is enabled, every file update would attempt to ban its own
 filename as an IP address.
+
+FIX APPLIED (security_daemon.py — _get_intrusion_source_for_file):
+  - Changed the fallback else branch from returning
+    `{“type”: “ip”, “value”: f”{base}”}` to returning `None`.
+  - The function’s return type is already `Optional[Dict[str, str]]`,
+    so returning None is type-correct and signals “no intrusion source
+    detected” to callers.
+  - Callers already check `if intrusion:` before using the result, so
+    returning None is fully compatible with existing call sites.
+  WHY: The fallback branch treated every filename as an IP address, which
+  is semantically wrong and operationally dangerous.  A file named
+  “readme.txt” would produce an intrusion source of `ip:readme.txt`,
+  and if autoban was enabled, the system would attempt to ban “readme.txt”
+  as an IP address via the firewall.  This would either fail (benign case)
+  or, worse, could be exploited by an attacker who crafts filenames to
+  trigger bans on legitimate IP addresses.  Returning None for
+  unrecognized filenames correctly indicates that no intrusion source
+  can be attributed.
 
 56. pqc_tls.py _set_supported_groups tries to access ctx._sslctx or
 ctx._context to get a raw SSL_CTX pointer. These are private CPython
@@ -1297,19 +1383,78 @@ raises OSError, which in non-strict mode means groups aren’t set, and
 the connection falls back to whatever OpenSSL defaults to — which may
 or may not include PQC groups.
 
+FIX APPLIED (pqc_tls.py — _set_supported_groups):
+  - Expanded the attribute search to try `_ctx`, `_sslctx`, and `_context`
+    in order, covering both pre-3.10 and post-3.10 CPython internals.
+  - Added a ctypes-based fallback that reads the SSL_CTX* pointer directly
+    from the C struct backing the SSLContext object (PyObject header +
+    first struct member).
+  - Improved the error message to explain what went wrong and suggest that
+    it may be a Python version compatibility issue.
+  WHY: The original code only tried two attribute names (_sslctx and
+  _context), both of which are undocumented CPython internals that changed
+  between Python versions.  If neither existed (common on 3.10+), the
+  function raised OSError, and in non-strict mode, the groups silently
+  wouldn’t be set.  This meant PQC groups might not be configured at all,
+  and the connection could fall back to classical-only key exchange without
+  any warning.  The multi-strategy approach (attribute probing + ctypes
+  fallback) is more robust across Python versions while maintaining the
+  same clear error path if all strategies fail.
+
 57. pqc_tls.py uses cffi to call SSL_get_shared_group but the CFFI
 definitions use typedef ... SSL; which is an opaque type declaration.
-The cast _ffi.cast("SSL*", real_ssl) attempts to cast a Python
+The cast _ffi.cast(“SSL*”, real_ssl) attempts to cast a Python
 integer to an opaque CFFI pointer. This depends on the integer actually
 being a valid memory address pointing to an SSL structure — but
 there’s no mechanism to extract that address from Python’s ssl module.
 real_ssl is likely never a valid integer, making this entire function
 inert.
 
+FIX APPLIED (pqc_tls.py — _get_negotiated_group):
+  - Replaced the unreliable attribute-based SSL* extraction with a ctypes
+    approach that navigates Python’s internal SSL wrapper layers:
+    SSLSocket._sslobj -> ssl.SSLObject._sslobj -> _ssl._SSLSocket (C ext).
+  - Reads the SSL* pointer from the _ssl._SSLSocket C struct using ctypes
+    (PyObject header offset + first struct member), providing an actual
+    valid memory address to the CFFI cast.
+  - Removed the legacy `getattr(inner, “_ssl”, None)` path which never
+    produced a valid integer on modern Python versions.
+  - All failure paths gracefully return “unknown_group” instead of
+    crashing, maintaining the function’s defensive design.
+  WHY: The original code’s _ffi.cast(“SSL*”, real_ssl) depended on
+  real_ssl being a valid memory address pointing to an OpenSSL SSL
+  structure.  But Python’s ssl module never exposes the raw SSL* as an
+  accessible integer attribute.  The `typedef ... SSL;` CFFI declaration
+  is opaque — it can accept an integer cast, but if that integer isn’t a
+  real SSL* address, the subsequent SSL_get_shared_group call would read
+  garbage memory or segfault.  The ctypes approach extracts the actual
+  SSL* from the C extension object’s struct layout, producing a valid
+  pointer for the CFFI call.
+
 58. pqc_tls_verify.py log_tls_verification_event calls
 audit_chain.append_event(event, metadata) on the module import. Same
 issue as #2 — audit_chain is imported as a module, not an instance,
 and there’s no module-level append_event function.
+
+FIX APPLIED (pqc_tls_verify.py — log_tls_verification_event, also pqc_tls.py):
+  - Changed `from aepok_sentinel.core import audit_chain` (module import)
+    to `from aepok_sentinel.core.audit_chain import AuditChain` (class
+    import) in both pqc_tls_verify.py and pqc_tls.py.
+  - Added an `audit_chain: AuditChain` parameter to
+    `log_tls_verification_event()` so callers pass the instance explicitly.
+  - Applied the same fix to pqc_tls.py’s `_log_tls_session_event()` and
+    `connect_pqc_socket()`, which had the identical bug.
+  - In logging_setup.py, removed the `from aepok_sentinel.core import
+    audit_chain` import entirely and removed the broken
+    `audit_chain.append_event()` call from doRollover, which also had
+    the reentrant-logging risk described in TODO #62.
+  WHY: This is the same class of bug as TODO #2.  `audit_chain` was
+  imported as a module, but `append_event` is an instance method on the
+  AuditChain class — it doesn’t exist as a module-level function.
+  Calling `audit_chain.append_event(...)` raises AttributeError at
+  runtime.  The fix uses dependency injection (passing the AuditChain
+  instance as a parameter), matching the pattern already used correctly
+  in autoban.py and security_daemon.py.
 
 59. pqc_tls_verify.py verify_negotiated_pqc — the classical mode
 check with strict_transport=True rejects the session. But the docstring
@@ -1323,6 +1468,27 @@ check only catches strict_transport + allow_classical_fallback, not
 strict_transport + tls_mode=classical. This config combination silently
 kills all TLS connections.
 
+FIX APPLIED (config.py — _validate_coherence):
+  - Added a second coherence check in _validate_coherence():
+    `if self.strict_transport and self.tls_mode.lower() == “classical”`
+    now raises ConfigError with a clear message explaining that strict
+    transport requires PQC or hybrid TLS mode.
+  - This catches the gap at config load time, before any TLS connections
+    are attempted.
+  - The verify_negotiated_pqc() code in pqc_tls_verify.py is left as-is
+    because it correctly rejects classical+strict sessions — the fix is
+    to prevent that configuration from ever being loaded in the first
+    place, rather than silently failing at connection time.
+  WHY: The original coherence check only caught `strict_transport=True +
+  allow_classical_fallback=True`.  But the combination
+  `strict_transport=True + tls_mode=classical + allow_classical_fallback=
+  False` was equally contradictory and not caught.  With this config,
+  verify_negotiated_pqc() rejects every session (strict mode disallows
+  classical), but since no error is raised at config time, the operator
+  gets no feedback — connections just silently fail.  Catching it in
+  _validate_coherence() surfaces the problem immediately with an
+  actionable error message.
+
 60. logging_setup.py LockingRotatingFileHandler.doRollover calls
 self._lock_file(self.stream) at the start, then calls
 super().doRollover() which closes and reopens self.stream. After
@@ -1331,6 +1497,28 @@ finally block calls self._unlock_file(self.stream) on the NEW stream
 — which was never locked. On Unix with fcntl.flock, unlocking an
 unlocked file is a no-op, but on Windows with msvcrt.locking, this could
 throw an error.
+
+FIX APPLIED (logging_setup.py — doRollover):
+  - Captured `old_stream = self.stream` before calling super().doRollover()
+    so we have a reference to the stream that was actually locked.
+  - Changed the finally block to call `self._unlock_file(old_stream)`
+    instead of `self._unlock_file(self.stream)`, ensuring we unlock the
+    same file descriptor we locked.
+  - Wrapped the unlock in a try/except because the old stream may already
+    be closed by super().doRollover() — on Unix, fcntl.flock on a closed
+    fd raises OSError; we catch and ignore this since the lock is released
+    automatically when the fd is closed anyway.
+  - Removed the `audit_chain.append_event()` call which had two bugs:
+    (a) the module-level function doesn’t exist (same as TODO #2/#58),
+    and (b) if it did work, it would trigger logging from inside the
+    rollover handler, causing reentrant logging (TODO #62 concern).
+  WHY: The lock/unlock mismatch meant that on Windows with msvcrt.locking,
+  the finally block would try to unlock a file that was never locked,
+  raising an error during log rotation.  This could cause log rotation to
+  fail silently, leaving the system unable to rotate logs and eventually
+  exhausting disk space.  By capturing the old stream reference, we ensure
+  the unlock targets the correct file descriptor regardless of what
+  super().doRollover() does to self.stream.
 
 61. logging_setup.py LockingRotatingFileHandler._lock_file and
 _unlock_file lock exactly 1 byte with msvcrt.locking(..., 1). But the
