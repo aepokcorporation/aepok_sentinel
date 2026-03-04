@@ -140,11 +140,16 @@ class AzureClient:
         """
         Creates a requests.Session that uses PQC TLS if strict_transport or tls_mode != 'classical',
         falling back to classical if not strict_transport and PQC fails.
+
+        FIX #78/#79: Same fix as malware_db.py — replaced the fragile nested
+        PQCPoolManager class + lambda init_poolmanager pattern with a proper
+        HTTPAdapter subclass.  See malware_db.py _build_requests_session for
+        the full rationale on why the old approach was broken.
         """
         sess = requests.Session()
 
         # If classical + not strict => normal TLS
-        tls_mode = self.config.raw_dict.get("tls_mode", "classical")
+        tls_mode = getattr(self.config, "tls_mode", "classical")
         if tls_mode == "classical" and not self.config.strict_transport:
             logger.info(
                 "AzureClient: Using classical TLS (tls_mode=%s, strict_transport=%s)",
@@ -163,28 +168,19 @@ class AzureClient:
             logger.warning("PQC context failed, fallback to classical TLS: %s", e)
             return sess
 
-        # Attach a custom HTTPS adapter to use PQC SSL context
         from requests.adapters import HTTPAdapter
-        from urllib3.poolmanager import PoolManager
 
-        class PQCPoolManager(PoolManager):
-            def __init__(self, ssl_context, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.ssl_context = ssl_context
+        class PQCHTTPAdapter(HTTPAdapter):
+            """HTTPAdapter subclass that injects a PQC SSL context."""
+            def __init__(self, pqc_ssl_context, **kwargs):
+                self._pqc_ssl_context = pqc_ssl_context
+                super().__init__(**kwargs)
 
-            def _new_pool(self, scheme, host, port, request_context=None):
-                pool = super()._new_pool(scheme, host, port, request_context=request_context)
-                if scheme == "https":
-                    pool.ssl_context = self.ssl_context
-                return pool
+            def init_poolmanager(self, connections, maxsize, block=False, **kwargs):
+                kwargs["ssl_context"] = self._pqc_ssl_context
+                super().init_poolmanager(connections, maxsize, block=block, **kwargs)
 
-        adapter = HTTPAdapter()
-        adapter.init_poolmanager = lambda connections, maxsize, block=None, **kw: PQCPoolManager(
-            ssl_context=ssl_ctx,
-            num_pools=connections,
-            maxsize=maxsize,
-            block=block
-        )
+        adapter = PQCHTTPAdapter(pqc_ssl_context=ssl_ctx)
         sess.mount("https://", adapter)
         return sess
 

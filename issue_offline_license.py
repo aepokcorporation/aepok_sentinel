@@ -84,12 +84,20 @@ def main():
     # Acquire Dilithium private key bytes
     dil_priv_key_bytes = None
     if args.use_azure:
-        # Minimal config for Azure usage
+        # FIX #76: The Azure config was missing several fields that downstream
+        # code accesses as attributes.  While SentinelConfig now sets defaults
+        # for all optional fields (tls_mode, cloud_keyvault_url, etc.), we
+        # explicitly include cloud_keyvault_enabled=True (needed by
+        # KeyManager._fetch_cloud_keys check) and allow_classical_fallback=False
+        # (PQC-only signing intent).  This makes the config self-documenting
+        # and avoids relying on implicit defaults for security-critical fields.
         raw_cfg = {
             "schema_version": 1,
             "mode": "cloud",
+            "cloud_keyvault_enabled": True,
             "cloud_keyvault_provider": "azure",
-            "cloud_keyvault_url": args.vault_url
+            "cloud_keyvault_url": args.vault_url,
+            "allow_classical_fallback": False
         }
         azure_cfg = SentinelConfig(raw_cfg)
         from aepok_sentinel.core.license import LicenseManager  # Not strictly required but consistent
@@ -120,10 +128,16 @@ def main():
         print("Error: no Dilithium private key bytes loaded.", file=sys.stderr)
         sys.exit(1)
 
-    # Prepare minimal config for signing
+    # FIX #75: "offline" is not a valid mode — the valid modes are
+    # (scif, airgap, cloud, demo, watch-only).  SentinelConfig._validate_mode()
+    # raises ConfigError for "offline", crashing the license generator before
+    # it can sign anything.  Changed to "airgap" which is the closest semantic
+    # match: an offline signing operation with no network access.
+    # Also added allow_classical_fallback=False for PQC-only signing.
     raw_minimal = {
         "schema_version": 1,
-        "mode": "offline"
+        "mode": "airgap",
+        "allow_classical_fallback": False
     }
     from aepok_sentinel.core.config import SentinelConfig
     cfg_for_sign = SentinelConfig(raw_minimal)

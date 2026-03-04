@@ -1,0 +1,21 @@
+# FIX #80: This file was empty.  Without build metadata, the package
+# cannot be installed via `pip install` and the import paths used
+# throughout the codebase (from aepok_sentinel.core.xxx import ...)
+# only work if the PARENT directory of this repo is on sys.path.
+#
+# For development: ensure /home/user (or the parent of aepok_sentinel/)
+# is on PYTHONPATH, e.g.:
+#   export PYTHONPATH="/home/user:$PYTHONPATH"
+#
+# The critical fix for #80 is the __init__.py file in this directory,
+# which marks aepok_sentinel as a proper Python package.
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "aepok_sentinel"
+version = "1.0.0"
+description = "Aepok Sentinel - Post-Quantum Cryptographic Security Platform"
+requires-python = ">=3.9"

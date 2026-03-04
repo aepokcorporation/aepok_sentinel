@@ -230,7 +230,9 @@ class ProvisionDevice:
             raise ProvisionError("Installer key not loaded => cannot sign .sentinelrc")
 
         try:
-            ephemeral_config = SentinelConfig({"mode": "cloud", "allow_classical_fallback": False})
+            # FIX #73: Added schema_version to ephemeral config — SentinelConfig.__init__
+            # requires raw_dict["schema_version"] (not .get()), so omitting it causes KeyError.
+            ephemeral_config = SentinelConfig({"schema_version": 1, "mode": "cloud", "allow_classical_fallback": False})
             sig_bundle = sign_content_bundle(
                 sentinelrc_json.encode("utf-8"),
                 ephemeral_config,
@@ -279,7 +281,9 @@ class ProvisionDevice:
             raise ProvisionError("Installer key not loaded => cannot sign identity.json")
 
         try:
-            ephemeral_config = SentinelConfig({"mode": "cloud", "allow_classical_fallback": False})
+            # FIX #73: Added schema_version to ephemeral config — SentinelConfig.__init__
+            # requires raw_dict["schema_version"] (not .get()), so omitting it causes KeyError.
+            ephemeral_config = SentinelConfig({"schema_version": 1, "mode": "cloud", "allow_classical_fallback": False})
             sig_bundle = sign_content_bundle(identity_json.encode("utf-8"), ephemeral_config, self._installer_priv, None)
 
             sig_b64 = base64.b64encode(json.dumps(sig_bundle).encode("utf-8"))
@@ -327,8 +331,15 @@ class ProvisionDevice:
             raise ProvisionError("liboqs not installed => cannot generate PQC keys")
 
         try:
-            from oqs import Signature
-            with Signature("Dilithium2") as sig:
+            # FIX #74: Removed `from oqs import Signature` direct package import.
+            # `oqs` is already imported at module level via pqc_crypto.py and
+            # checked above (`if not oqs`).  The dual import path was redundant
+            # and confusing: if pqc_crypto's oqs is None because liboqs isn't
+            # installed, `from oqs import Signature` would also fail with a
+            # different error.  If pqc_crypto's import failed for another reason,
+            # the `not oqs` guard would be wrong.  Using `oqs.Signature`
+            # consistently relies on a single import path.
+            with oqs.Signature("Dilithium2") as sig:
                 sig.generate_keypair()
                 vendor_priv = sig.export_secret_key()
                 vendor_pub = sig.export_public_key()
@@ -342,7 +353,9 @@ class ProvisionDevice:
             if not self._installer_priv:
                 raise ProvisionError("Installer key not loaded => cannot sign vendor_dil keys")
 
-            ephemeral_config = SentinelConfig({"mode": "cloud", "allow_classical_fallback": False})
+            # FIX #73: Added schema_version to ephemeral config — SentinelConfig.__init__
+            # requires raw_dict["schema_version"] (not .get()), so omitting it causes KeyError.
+            ephemeral_config = SentinelConfig({"schema_version": 1, "mode": "cloud", "allow_classical_fallback": False})
 
             # sign the private key
             priv_sig = sign_content_bundle(vendor_priv, ephemeral_config, self._installer_priv, None)
@@ -378,8 +391,9 @@ class ProvisionDevice:
         # bootstrap operation that runs before normal key-rotation policy
         # applies, so the license guard is inappropriate at this stage.
         try:
-            from oqs import KeyEncapsulation as _KEM
-            with _KEM("Kyber512") as kem:
+            # FIX #74: Same as Signature above — use oqs.KeyEncapsulation
+            # from the already-imported module instead of a separate package import.
+            with oqs.KeyEncapsulation("Kyber512") as kem:
                 kem.generate_keypair()
                 kyber_priv = kem.export_secret_key()
                 kyber_pub = kem.export_public_key()
@@ -506,7 +520,8 @@ class ProvisionDevice:
             raise ProvisionError("No vendor Dilithium private key => cannot sign trust_anchor")
 
         try:
-            device_config = SentinelConfig({"mode": "airgap", "allow_classical_fallback": False})
+            # FIX #73: Added schema_version — same KeyError fix as the cloud ephemeral configs.
+            device_config = SentinelConfig({"schema_version": 1, "mode": "airgap", "allow_classical_fallback": False})
             sig_bundle = sign_content_bundle(anchor_json.encode("utf-8"), device_config, self._vendor_dil_priv, None)
             sig_b64 = base64.b64encode(json.dumps(sig_bundle).encode("utf-8"))
             with open(f"{self._trust_anchor_path}.sig", "wb") as sf:

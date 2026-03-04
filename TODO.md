@@ -1726,6 +1726,19 @@ provisioning (vendor_dilithium_priv) and rotation (dilithium_priv). The
 rotated keys are never found alongside the vendor keys because they have
 different prefixes.
 
+**FIX #71 (COMPLETED):** Added a vendor-prefix fallback to
+`_find_latest_key()` in `core/key_manager.py`. When no files matching
+the base prefix (e.g. `dilithium_priv`) are found, the method now also
+searches for files starting with `vendor_<prefix>` (e.g.
+`vendor_dilithium_priv`). This bridges the gap between provisioning
+(which creates `vendor_dilithium_priv.bin`) and the first key rotation
+(which creates `dilithium_priv_YYYYMMDD_HHMMSS.bin`). Without this
+fallback, `fetch_current_keys()` and `rotate_keys()` would fail to find
+any dilithium key before the first rotation, making the system unusable
+immediately after provisioning. The fallback is only tried when the
+primary prefix search returns no results, so after the first rotation
+the timestamped keys take precedence as expected.
+
 72. config.py SentinelConfig.__init__ sets self.license_path using
 _apply_license_path_contract which may return a string. But license.py
 LicenseManager.__init__ also sets its own self.license_path from
@@ -1735,6 +1748,20 @@ paths — one on the config object and one on the license manager —
 that may disagree. The config’s path is never actually used by the
 license manager.
 
+**FIX #72 (COMPLETED):** Removed the duplicate license path computation
+from `LicenseManager.__init__()` in `core/license.py`. The manager now
+uses `config.license_path` (already validated by
+`SentinelConfig._apply_license_path_contract()`) as the single source of
+truth via `self.license_path = Path(config.license_path)`. Previously,
+both `SentinelConfig` and `LicenseManager` independently computed a
+license path — one via `_apply_license_path_contract()` and the other
+via its own `resolve_path()` + `raw_dict["license_path"]` override logic.
+These two paths could silently disagree, meaning code reading
+`config.license_path` and code reading `license_mgr.license_path` might
+reference different files. Consolidating to a single computation
+eliminates the divergence risk and removes ~30 lines of redundant path
+validation logic from LicenseManager.
+
 73. provision_device.py collect_user_input hardcodes a config dict with
 "cloud_keyvault_url", "cloud_dilithium_secret",
 "cloud_kyber_secret", "license_required", "bound_to_hardware", and
@@ -1743,6 +1770,20 @@ known_keys set of SentinelConfig._check_for_unknown_keys, and
 allow_unknown_keys defaults to False. Passing this config to
 SentinelConfig throws ConfigError for unknown keys. The provisioner
 can’t create a valid config using its own output.
+
+**FIX #73 (COMPLETED):** Two-part fix. (1) The known_keys issue was
+already resolved in a prior fix batch — all keys used by
+`collect_user_input()` (cloud_keyvault_url, cloud_dilithium_secret,
+cloud_kyber_secret, license_required, bound_to_hardware,
+allow_unknown_keys, anchor_export_path, etc.) are now in the
+`_check_for_unknown_keys()` known set. (2) Fixed four ephemeral
+`SentinelConfig()` constructors in `provision_device.py` (at
+`build_and_validate_sentinelrc`, `generate_host_identity`,
+`generate_keys`, and `build_trust_anchor`) that were missing
+`schema_version: 1`. `SentinelConfig.__init__` accesses
+`raw_dict["schema_version"]` (not `.get()`), so omitting it caused
+`KeyError`. Added `"schema_version": 1` to all four ephemeral config
+dicts.
 
 74. provision_device.py imports from aepok_sentinel.core.pqc_crypto
 import sign_content_bundle, CryptoSignatureError, oqs. The oqs imported
@@ -1755,11 +1796,34 @@ wrong. If pqc_crypto’s oqs is None because the import genuinely failed,
 the from oqs import Signature will also fail. The dual import path is
 redundant and confusing.
 
+**FIX #74 (COMPLETED):** Replaced `from oqs import Signature` and
+`from oqs import KeyEncapsulation as _KEM` with `oqs.Signature` and
+`oqs.KeyEncapsulation` respectively, using the already-imported `oqs`
+module from `pqc_crypto.py`. The dual import path was both redundant and
+misleading: if `pqc_crypto`’s `oqs` is `None` (liboqs not installed),
+the `if not oqs` guard catches it — but then `from oqs import Signature`
+would throw a *different* ImportError with confusing traceback. If
+`pqc_crypto`’s import failed for a non-installation reason (e.g.
+version mismatch), the `not oqs` check would be wrong while the direct
+`from oqs import` might succeed, bypassing the intended guard. Using a
+single import path through `pqc_crypto.oqs` gives consistent failure
+behavior: one guard, one import source, one error path.
+
 75. issue_offline_license.py constructs SentinelConfig with
 {"schema_version": 1, "mode": "offline"}. "offline" is not in
 the valid modes list (scif, airgap, cloud, demo, watch-only).
 SentinelConfig._validate_mode() raises ConfigError. The license
 generator crashes before it can sign anything.
+
+**FIX #75 (COMPLETED):** Changed `"mode": "offline"` to
+`"mode": "airgap"` in `issue_offline_license.py` (the signing config
+for the offline key path). "airgap" is the closest valid mode to the
+intended "offline" semantics: it implies no network access, hardened
+enforcement by default, and no cloud key vault usage — exactly the
+posture of an offline signing workstation. Also added
+`allow_classical_fallback: False` to enforce PQC-only signing. The
+license generator previously crashed with `ConfigError: Invalid mode
+‘offline’` before any signing could occur.
 
 76. issue_offline_license.py constructs a second SentinelConfig with
 {"schema_version": 1, "mode": "cloud"} when using Azure. This one
@@ -1772,9 +1836,32 @@ accesses optional fields from raw_dict.get(...). Missing fields like
 tls_mode won’t be set as attributes (per #8), so any code path touching
 config.tls_mode from the Azure client will crash.
 
+**FIX #76 (COMPLETED):** Added `cloud_keyvault_enabled: True` and
+`allow_classical_fallback: False` to the Azure config dict in
+`issue_offline_license.py`. The missing-attribute problem described in
+the original issue (tls_mode, cloud_keyvault_url not set) was already
+resolved by an earlier fix in `config.py` — all optional fields are now
+set via `raw_dict.get()` with sensible defaults, so `config.tls_mode`
+defaults to "hybrid" and `config.cloud_keyvault_url` defaults to "".
+The remaining fix here makes the Azure config dict self-documenting and
+explicit about its security posture: `cloud_keyvault_enabled: True`
+communicates intent (needed by `KeyManager._fetch_cloud_keys()` check),
+and `allow_classical_fallback: False` enforces PQC-only signing
+consistent with Sentinel’s post-quantum security model.
+
 77. status_printer.py accesses config.cloud_keyvault_url which is never
 set as an attribute on SentinelConfig. It’s only in raw_dict if the user
 configured it. AttributeError whenever status is printed in cloud mode.
+
+**FIX #77 (COMPLETED):** The root cause was already fixed in `config.py`
+where `self.cloud_keyvault_url = raw_dict.get("cloud_keyvault_url", "")`
+now ensures the attribute always exists with a default of "". As an
+additional defensive measure, `status_printer.py` now uses
+`getattr(config, "cloud_keyvault_url", "")` instead of direct attribute
+access. This protects against ephemeral configs or older SentinelConfig
+instances that might not have the attribute. The belt-and-suspenders
+approach ensures status printing never crashes regardless of how the
+config was constructed.
 
 78. malware_db.py _build_requests_session defines PQCPoolManager as a
 nested class inside the method, with _new_pool overriding the parent.
@@ -1784,6 +1871,17 @@ If the installed urllib3 version doesn’t match the expected signature
 silently doesn’t apply or crashes. Same nested class pattern exists in
 azure_client.py — duplicated code with the same fragility.
 
+**FIX #78 (COMPLETED):** Replaced the fragile nested `PQCPoolManager`
+class (which overrode `PoolManager._new_pool` with a hardcoded
+signature) with a proper `PQCHTTPAdapter` subclass of `HTTPAdapter` in
+both `utils/malware_db.py` and `core/azure_client.py`. The new adapter
+overrides `init_poolmanager()` and passes `ssl_context` as a keyword
+argument to `PoolManager` — the documented, stable interface. This
+avoids relying on `_new_pool`’s internal signature, which varies across
+urllib3 versions (some versions don’t have `request_context`, some use
+different parameter names like `request_context` vs `context`). The fix
+eliminates the cross-version fragility in both files simultaneously.
+
 79. malware_db.py _build_requests_session reassigns
 adapter.init_poolmanager to a lambda. But init_poolmanager is called by
 HTTPAdapter.send() during request execution, and by this point the
@@ -1791,6 +1889,17 @@ adapter has already been mounted on the session. The lambda replaces the
 method, but HTTPAdapter.__init__ may have already called
 init_poolmanager in some versions of requests/urllib3. The PQC context
 may never actually be applied to connections.
+
+**FIX #79 (COMPLETED):** Fixed by the same `PQCHTTPAdapter` subclass
+introduced in #78. The old code created a plain `HTTPAdapter()`, which
+calls `self.init_poolmanager()` during `__init__()` — initializing the
+pool manager with default (non-PQC) settings BEFORE the lambda could
+replace the method. By using a subclass, `init_poolmanager()` is
+overridden at the class level, so when `HTTPAdapter.__init__()` calls
+`self.init_poolmanager()`, it invokes our override from the start. The
+PQC SSL context is injected into the very first pool manager instance,
+guaranteeing PQC TLS is applied to all connections. Applied to both
+`malware_db.py` and `azure_client.py`.
 
 80. No __init__.py files are visible or mentioned anywhere. The
 import paths throughout the codebase assume a package structure (from
@@ -1800,3 +1909,16 @@ these imports resolve in standard Python. The repo has a setup.py and
 pyproject.toml which might declare packages, but implicit namespace
 packages behave differently across Python versions and installation
 methods.
+
+**FIX #80 (COMPLETED):** Created `aepok_sentinel/__init__.py` — the
+top-level package marker that was missing. All subdirectories (core/,
+utils/, cli/, gui/, deploy/, tests/) already had their own `__init__.py`
+files; only the root package marker was absent. Without it, `from
+aepok_sentinel.core.config import ...` fails with `ModuleNotFoundError`
+in standard Python (non-namespace-package mode). Also populated the
+previously-empty `pyproject.toml` with minimal build metadata so the
+package can be discovered by setuptools. The `setup.py` and
+`setup.cfg` remain empty placeholders — the `pyproject.toml` is
+sufficient for modern Python packaging (PEP 621). For development use,
+the parent directory of `aepok_sentinel/` must be on `PYTHONPATH` or the
+package installed via `pip install -e` from a parent-level project root.
