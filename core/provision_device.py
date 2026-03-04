@@ -80,7 +80,7 @@ class ProvisionDevice:
         self._keys_dir = resolve_path("keys")
         self._installer_key_path = resolve_path("keys", "installer_dilithium_priv.bin")
         
-        self._vendor_dil_priv: bytes = b""
+        self._vendor_dil_priv: bytearray = bytearray()
         self._vendor_dil_pub: bytes = b""
         self._license_mgr: Optional[LicenseManager] = None
         self._key_mgr: Optional[KeyManager] = None
@@ -100,32 +100,68 @@ class ProvisionDevice:
          - lock_provisioning
          - append_audit_log
          - self_destruct if all success
+
+        FIX #38: Wrapped the file-writing steps in a try/except that calls
+        _rollback_provisioned_files() on failure.  Previously, if
+        build_trust_anchor() failed (e.g. because Kyber keys were missing per
+        #36), .sentinelrc, identity.json, and the license had already been
+        written to disk with no rollback.  The system was left in a
+        half-provisioned state — not locked (no flag), but with partial
+        artifacts that could confuse subsequent provisioning attempts.
         """
         self._check_if_already_provisioned()
         logger.info("Starting device provisioning...")
 
         self._load_installer_private_key()
 
-        # 1) build + validate .sentinelrc => sign
-        self.build_and_validate_sentinelrc(raw_config)
+        # Track files written so we can roll back on failure
+        written_files = []
 
-        # now that we have a valid config => create LicenseManager, KeyManager
-        self._sentinel_config = SentinelConfig(raw_config)
-        self._license_mgr = LicenseManager(self._sentinel_config)
-        self._key_mgr = KeyManager(self._sentinel_config, self._license_mgr)
+        try:
+            # 1) build + validate .sentinelrc => sign
+            self.build_and_validate_sentinelrc(raw_config)
+            written_files.append(self._sentinelrc_path)
+            sig_path = Path(f"{self._sentinelrc_path}.sig")
+            if sig_path.is_file():
+                written_files.append(sig_path)
 
-        # 2) generate_host_identity => sign identity.json
-        self.generate_host_identity()
+            # now that we have a valid config => create LicenseManager, KeyManager
+            self._sentinel_config = SentinelConfig(raw_config)
+            self._license_mgr = LicenseManager(self._sentinel_config)
+            self._key_mgr = KeyManager(self._sentinel_config, self._license_mgr)
 
-        # 3) upload + verify license => abort if invalid
-        self.upload_license(license_file)
+            # 2) generate_host_identity => sign identity.json
+            self.generate_host_identity()
+            written_files.append(self._identity_path)
+            sig_path = Path(f"{self._identity_path}.sig")
+            if sig_path.is_file():
+                written_files.append(sig_path)
 
-        # 4) generate keys => vendor_dil + others => sign them
-        self.generate_keys()
+            # 3) upload + verify license => abort if invalid
+            self.upload_license(license_file)
+            written_files.append(self._license_path)
 
-        # 5) build + sign trust_anchor.json with vendor_dil key
-        self.build_trust_anchor()
+            # 4) generate keys => vendor_dil + others => sign them
+            self.generate_keys()
+            # Track all key files generated in keys_dir
+            if self._keys_dir.is_dir():
+                for kf in self._keys_dir.iterdir():
+                    if kf.is_file() and kf not in written_files:
+                        written_files.append(kf)
 
+            # 5) build + sign trust_anchor.json with vendor_dil key
+            self.build_trust_anchor()
+            written_files.append(self._trust_anchor_path)
+            sig_path = Path(f"{self._trust_anchor_path}.sig")
+            if sig_path.is_file():
+                written_files.append(sig_path)
+
+        except Exception as e:
+            logger.error("Provisioning failed at step => %s. Rolling back written files.", e)
+            self._rollback_provisioned_files(written_files)
+            raise
+
+        # Past the point of no return — all critical files are written and valid
         # 6) lock provisioning => create provisioning_complete.flag
         self.lock_provisioning()
 
@@ -321,18 +357,86 @@ class ProvisionDevice:
                 sf.write(pub_b64)
 
             logger.info("Vendor Dilithium keys generated + signed => %s, %s", priv_path, pub_path)
-            self._vendor_dil_priv = vendor_priv
+            # FIX #37: Store as bytearray so self_destruct() can zero in-place
+            self._vendor_dil_priv = bytearray(vendor_priv)
             self._vendor_dil_pub = vendor_pub
         except Exception:
             logger.exception("Failed to generate vendor Dilithium keys")
             raise ProvisionError("Failed to generate vendor Dilithium keys")
 
-        # For kyber & optional RSA => rely on KeyManager
+        # FIX #36: The previous code called self._key_mgr.rotate_keys() to
+        # generate Kyber (and optional RSA) keys.  However, rotate_keys()
+        # checks is_watch_only() and is_license_valid() before proceeding.
+        # During initial provisioning the license was just uploaded moments
+        # before and may not yet be in a valid state (see #27/#28), so
+        # rotate_keys() would silently skip, leaving no Kyber keys on disk.
+        # build_trust_anchor() then fails because it requires Kyber key hashes.
+        #
+        # Fix: generate Kyber (and optional RSA) keys directly here, the same
+        # way we generate vendor Dilithium keys above — bypassing the
+        # license-gated rotate_keys() entirely.  Provisioning is a one-time
+        # bootstrap operation that runs before normal key-rotation policy
+        # applies, so the license guard is inappropriate at this stage.
         try:
-            self._key_mgr.rotate_keys()  # triggers local generation logic
+            from oqs import KeyEncapsulation as _KEM
+            with _KEM("Kyber512") as kem:
+                kem.generate_keypair()
+                kyber_priv = kem.export_secret_key()
+                kyber_pub = kem.export_public_key()
+
+            kyber_priv_path = resolve_path("keys", "kyber_priv.bin")
+            kyber_pub_path = resolve_path("keys", "kyber_pub.bin")
+            kyber_priv_path.write_bytes(kyber_priv)
+            kyber_pub_path.write_bytes(kyber_pub)
+
+            # Sign each Kyber key file with the installer key
+            kyber_priv_sig = sign_content_bundle(kyber_priv, ephemeral_config, self._installer_priv, None)
+            kyber_priv_sig_b64 = base64.b64encode(json.dumps(kyber_priv_sig).encode("utf-8"))
+            with open(f"{kyber_priv_path}.sig", "wb") as sf:
+                sf.write(kyber_priv_sig_b64)
+
+            kyber_pub_sig = sign_content_bundle(kyber_pub, ephemeral_config, self._installer_priv, None)
+            kyber_pub_sig_b64 = base64.b64encode(json.dumps(kyber_pub_sig).encode("utf-8"))
+            with open(f"{kyber_pub_path}.sig", "wb") as sf:
+                sf.write(kyber_pub_sig_b64)
+
+            logger.info("Kyber keys generated + signed => %s, %s", kyber_priv_path, kyber_pub_path)
+
         except Exception:
-            logger.exception("Failed to generate PQC encryption or RSA keys.")
-            raise ProvisionError("Failed to generate PQC encryption or RSA keys")
+            logger.exception("Failed to generate Kyber encryption keys.")
+            raise ProvisionError("Failed to generate Kyber encryption keys")
+
+        # Optional RSA key generation if classical fallback is enabled
+        if getattr(self._sentinel_config, "allow_classical_fallback", False):
+            try:
+                from cryptography.hazmat.primitives.asymmetric import rsa as _rsa_mod
+                from cryptography.hazmat.primitives import serialization as _ser
+                rsa_key = _rsa_mod.generate_private_key(public_exponent=65537, key_size=2048)
+                rsa_priv_bytes = rsa_key.private_bytes(
+                    encoding=_ser.Encoding.PEM,
+                    format=_ser.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=_ser.NoEncryption()
+                )
+                rsa_pub_bytes = rsa_key.public_key().public_bytes(
+                    encoding=_ser.Encoding.PEM,
+                    format=_ser.PublicFormat.SubjectPublicKeyInfo
+                )
+
+                rsa_priv_path = resolve_path("keys", "rsa_priv.pem")
+                rsa_pub_path = resolve_path("keys", "rsa_pub.pem")
+                rsa_priv_path.write_bytes(rsa_priv_bytes)
+                rsa_pub_path.write_bytes(rsa_pub_bytes)
+
+                rsa_priv_sig = sign_content_bundle(rsa_priv_bytes, ephemeral_config, self._installer_priv, None)
+                rsa_priv_sig_b64 = base64.b64encode(json.dumps(rsa_priv_sig).encode("utf-8"))
+                with open(f"{rsa_priv_path}.sig", "wb") as sf:
+                    sf.write(rsa_priv_sig_b64)
+
+                logger.info("RSA fallback keys generated + signed => %s, %s", rsa_priv_path, rsa_pub_path)
+
+            except Exception:
+                logger.exception("Failed to generate RSA fallback keys.")
+                raise ProvisionError("Failed to generate RSA fallback keys")
 
     def build_trust_anchor(self) -> None:
         """
@@ -466,19 +570,32 @@ class ProvisionDevice:
         """
         If everything succeeded => remove provision_device.py & installer_dilithium_priv.bin,
         zero memory caches, log final event: DEVICE_PROVISIONED_SECURE
+
+        FIX #37: The previous code created bytearray copies of the immutable
+        bytes objects (self._installer_priv, self._vendor_dil_priv) and zeroed
+        those copies.  The original bytes objects are immutable and remained
+        untouched in Python's heap until garbage collected — and even then may
+        persist in freed memory.  The "secure zeroization" was theater.
+
+        Fix: _load_installer_private_key() and generate_keys() now store keys
+        as bytearray (mutable) from the start.  Here we zero the actual
+        bytearray in-place using pqc_crypto.secure_zero(), then discard the
+        reference.  This is the best-effort approach within CPython's managed
+        heap — true guaranteed zeroization requires a C extension or OS-level
+        mlock/madvise, which is beyond Python's memory model.
         """
-        # Zero memory
+        from aepok_sentinel.core.pqc_crypto import secure_zero
+
+        # Zero memory — keys are now stored as bytearray (mutable)
         if self._installer_priv:
-            ba = bytearray(self._installer_priv)
-            for i in range(len(ba)):
-                ba[i] = 0
+            if isinstance(self._installer_priv, bytearray):
+                secure_zero(self._installer_priv)
             self._installer_priv = None
 
         if self._vendor_dil_priv:
-            vb = bytearray(self._vendor_dil_priv)
-            for i in range(len(vb)):
-                vb[i] = 0
-            self._vendor_dil_priv = b""
+            if isinstance(self._vendor_dil_priv, bytearray):
+                secure_zero(self._vendor_dil_priv)
+            self._vendor_dil_priv = bytearray()
 
         # Attempt removing the installer key
         if self._installer_key_path.is_file():
@@ -508,6 +625,19 @@ class ProvisionDevice:
 
     # ----------------- Helpers -----------------
 
+    def _rollback_provisioned_files(self, written_files) -> None:
+        """
+        FIX #38: Remove all files written during a failed provisioning
+        attempt so the system is not left in a half-provisioned state.
+        """
+        for fpath in reversed(written_files):
+            try:
+                if fpath.is_file():
+                    fpath.unlink()
+                    logger.info("Rollback: removed %s", fpath)
+            except Exception:
+                logger.exception("Rollback: failed to remove %s", fpath)
+
     def _check_if_already_provisioned(self) -> None:
         if self._provision_flag_path.is_file():
             raise ProvisionError("Cannot proceed => provisioning_complete.flag exists => device already provisioned.")
@@ -516,7 +646,9 @@ class ProvisionDevice:
         if not self._installer_key_path.is_file():
             raise ProvisionError(f"Installer key not found at {self._installer_key_path}")
         try:
-            self._installer_priv = self._installer_key_path.read_bytes()
+            # FIX #37: Store as bytearray (mutable) so self_destruct() can
+            # zero the actual key material in-place, not a throwaway copy.
+            self._installer_priv = bytearray(self._installer_key_path.read_bytes())
         except Exception:
             logger.exception("Failed reading installer key")
             raise ProvisionError("Failed reading installer key")

@@ -90,17 +90,33 @@ class LicenseManager:
         # Then we accept it. Otherwise, we keep the default.
         if "license_path" in config.raw_dict:
             candidate_str = config.raw_dict["license_path"]
-            candidate = Path(candidate_str)
-            resolved = resolve_path(*candidate.parts)
-            # If we must ensure it's under the runtime, we can do:
-            # (In final shape, you'd have a known base path to compare. We'll do a naive check.)
-            # For example, we might compare if not str(resolved).startswith(str(sentinel_runtime_base_path)):
-            # or we skip. We'll do a minimal approach:
-            # if sentinel_runtime_base is set, we ensure.
-            if sentinel_runtime_base:
-                rp = Path(sentinel_runtime_base).resolve()
-                if not str(resolved).startswith(str(rp)):
-                    raise LicenseError(f"Rejected unsafe override path outside runtime: {resolved}")
+            # FIX #32: resolve_path(*candidate.parts) was called with the
+            # full absolute-path parts (e.g. ('/', 'etc', 'sentinel', ...)),
+            # which prepended every component under SENTINEL_RUNTIME_BASE,
+            # producing a nonsensical path like /opsec/.../runtime///etc/...
+            # that could never match anything real.
+            #
+            # Instead we resolve the user-supplied path directly and compare
+            # it against the runtime base using Path parentage (not fragile
+            # string startswith).  If it falls inside the runtime tree we
+            # canonicalise it through resolve_path(); otherwise we accept the
+            # external path as-is after a runtime-base guard check.
+            candidate = Path(candidate_str).resolve()
+            from aepok_sentinel.core.directory_contract import SENTINEL_RUNTIME_BASE
+            runtime_base = SENTINEL_RUNTIME_BASE.resolve()
+            try:
+                candidate.relative_to(runtime_base)
+                # Path is inside the runtime tree → canonicalise via contract
+                resolved = resolve_path("license", "license.key")
+            except ValueError:
+                # Path is outside the runtime tree
+                resolved = candidate
+                if sentinel_runtime_base:
+                    rp = Path(sentinel_runtime_base).resolve()
+                    try:
+                        resolved.relative_to(rp)
+                    except ValueError:
+                        raise LicenseError(f"Rejected unsafe override path outside runtime: {resolved}")
             self.license_path = resolved
         else:
             self.license_path = self.default_license_path

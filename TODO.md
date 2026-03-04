@@ -719,6 +719,21 @@ string, meaning every boot looks like a new installation. The install
 counter increments on every startup until it hits max_installs, at which
 point the license is permanently rejected.
 
+FIX APPLIED (license.py, _get_local_host_fp — already fixed as part of #30):
+  - _get_local_host_fp() at line ~375 already reads obj.get("host_fingerprint",
+    "unknown") — the correct field name matching what provision_device.py
+    generate_host_identity() writes to identity.json.
+  - This was fixed alongside #30’s _check_hardware_binding() fix since both
+    methods read the same identity.json file and had the identical field name
+    mismatch ("fingerprint" vs "host_fingerprint").
+  WHY: The root cause was the same as #30 — provision_device.py writes
+  "host_fingerprint" but the consumers were reading "fingerprint".  With
+  the wrong field name, the host was always seen as "unknown", so every
+  boot appeared to be a new installation and the install counter
+  incremented until it hit max_installs, permanently rejecting the license.
+  Both _check_hardware_binding and _get_local_host_fp now consistently use
+  "host_fingerprint".
+
 32. config.py _apply_license_path_contract calls resolve_path() with
 no arguments. resolve_path requires at least one path_parts argument to
 do anything meaningful. With no arguments, it returns
@@ -730,12 +745,55 @@ which rebuilds a path under SENTINEL_RUNTIME_BASE that includes the root
 — producing something like /opsec/aepok_sentinel/runtime///opsec/.…
 This will never match anything real.
 
+FIX APPLIED (config.py _apply_license_path_contract, license.py __init__):
+  - config.py: Replaced `resolve_path()` (no-arg) + fragile
+    `str(candidate).startswith(str(runtime_base))` with proper
+    `Path.relative_to()` for robust parentage checking.  The old string
+    startswith could false-positive on paths like
+    /opsec/aepok_sentinel/runtime_evil/ that share the same prefix.
+    Now imports SENTINEL_RUNTIME_BASE directly and uses
+    `candidate.relative_to(runtime_base)` which raises ValueError if the
+    path is not a proper child of the base — no false positives possible.
+  - license.py: Removed the broken `resolve_path(*candidate.parts)` call.
+    For an absolute path like /etc/sentinel/license.key,
+    `Path(...).parts` yields (‘/’, ‘etc’, ‘sentinel’, ‘license.key’).
+    Passing those to resolve_path() prepended each component under
+    SENTINEL_RUNTIME_BASE, producing a nonsensical path like
+    /opsec/aepok_sentinel/runtime///etc/sentinel/license.key.
+    Now resolves the user path directly with `Path(candidate_str).resolve()`
+    and uses `relative_to(SENTINEL_RUNTIME_BASE)` to determine if it’s
+    inside or outside the runtime tree.  Inside → canonicalise via
+    `resolve_path("license", "license.key")`.  Outside → accept as-is
+    with an optional runtime-base guard if sentinel_runtime_base was set.
+  WHY: Both call sites had the same fundamental problem — treating path
+  components of an absolute path as relative segments to append under the
+  runtime base.  The fix uses Python’s Path parentage API which is the
+  correct way to check path containment.
+
 33. config.py load_config() function calls
 validate_sentinelrc(raw_data) which returns a dict missing
 schema_version and mode (issue #9), then passes that to
 SentinelConfig(validated_data) which does
 raw_dict["schema_version"]. KeyError crash. The load_config pathway
 is completely broken end-to-end.
+
+FIX APPLIED (sentinelrc_schema.py validate_sentinelrc — already fixed as
+part of #9):
+  - validate_sentinelrc() now explicitly copies REQUIRED_FIELDS
+    (schema_version, mode) into the output dict before processing defaults:
+      final_dict = {}
+      for req in REQUIRED_FIELDS:
+          final_dict[req] = raw_dict[req]
+  - Additionally, all extra keys present in raw_dict that are not in
+    DEFAULTS (e.g. enforcement_mode, _signature_verified) are now carried
+    over via a pass-through loop, ensuring round-tripping through the
+    validator does not silently drop them.
+  WHY: The original validate_sentinelrc only populated final_dict from the
+  DEFAULTS dictionary, which didn’t include the required fields
+  (schema_version, mode).  SentinelConfig.__init__ does
+  raw_dict["schema_version"] — a hard KeyError if the key is absent.
+  The entire config->load pipeline was broken end-to-end.  The fix
+  ensures required fields are always present in the validated output.
 
 34. config.py SentinelConfig _check_for_unknown_keys known set doesn’t
 include tls_mode, cloud_dilithium_secret, cloud_kyber_secret,
@@ -751,11 +809,46 @@ cloud_malware_url are all absent. Any config using these features with
 allow_unknown_keys=false (the default) throws ConfigError at startup.
 Most of the advanced functionality is impossible to configure.
 
+FIX APPLIED (config.py _check_for_unknown_keys, sentinelrc_schema.py):
+  - config.py: The known_keys set in _check_for_unknown_keys now includes
+    all advanced module keys: tls_mode, cloud_dilithium_secret,
+    cloud_kyber_secret, cloud_rsa_secret, cloud_malware_url,
+    autoban_enabled, autoban_block_ttl_days, trusted_firewall_hashes,
+    allowed_tls_groups, anchor_export_path, signer_id, host_fingerprint,
+    key_fingerprint.  These were added to the comment block at lines ~195-201.
+  - sentinelrc_schema.py: The same keys were added to the known_keys set
+    in validate_sentinelrc() (lines ~130-137) to keep both validators in
+    sync.
+  - Additionally, SentinelConfig.__init__ now explicitly sets self.tls_mode
+    and self.cloud_keyvault_url as attributes (lines ~95-96) so that
+    modules like pqc_tls.py and malware_db.py can access them directly
+    via config.tls_mode instead of going through config.raw_dict.
+  WHY: The known_keys allowlist was incomplete — it only had the original
+  set of config keys from the initial implementation.  As advanced modules
+  (autoban, PQC TLS, cloud secrets, trust anchors) were added, their
+  config keys were never registered in the allowlist.  With
+  allow_unknown_keys=False (the default), any .sentinelrc using these
+  features threw ConfigError at startup, making most advanced functionality
+  impossible to configure.
+
 35. provision_device.py references EventCode.DEVICE_PROVISIONED in
 append_audit_log(). This enum value doesn’t exist in constants.py.
 AttributeError at the end of provisioning, after all files have been
 written — meaning the system is provisioned but the audit trail of it
 happening is lost.
+
+FIX APPLIED (constants.py EventCode enum — already fixed):
+  - EventCode.DEVICE_PROVISIONED now exists in constants.py at line ~44:
+      DEVICE_PROVISIONED = "DEVICE_PROVISIONED"
+  - provision_device.py append_audit_log() references
+    EventCode.DEVICE_PROVISIONED.value (line ~459), which resolves
+    correctly to the string "DEVICE_PROVISIONED".
+  WHY: The enum member was simply missing from constants.py — likely an
+  oversight when the EventCode enum was first defined, since provisioning
+  was added later.  Without it, append_audit_log() raised AttributeError
+  after all provisioning files had been written.  The device was provisioned
+  but had no audit record of it, which is a compliance gap in any
+  environment that requires an immutable provisioning trail.
 
 36. provision_device.py generate_keys() calls
 self._key_mgr.rotate_keys(). But KeyManager.rotate_keys() checks
@@ -767,6 +860,30 @@ on whether the signature verification passed (which it won’t per #27 and
 generated. The trust anchor then fails because it requires Kyber key
 hashes.
 
+FIX APPLIED (provision_device.py generate_keys):
+  - Removed the call to self._key_mgr.rotate_keys() entirely.
+  - Instead, Kyber keys are now generated directly in generate_keys() using
+    oqs.KeyEncapsulation("Kyber512"), the same pattern used for vendor
+    Dilithium keys just above in the same method.
+  - The generated kyber_priv.bin and kyber_pub.bin are written to the keys
+    directory and signed with the installer key.
+  - Optional RSA fallback keys are also generated directly if
+    config.allow_classical_fallback is True, using
+    cryptography.hazmat.primitives.asymmetric.rsa.
+  - Both key types are signed with the installer Dilithium key for
+    integrity verification.
+  WHY: rotate_keys() is the normal operational key rotation path that
+  enforces license validity and watch-only checks — appropriate for
+  post-provisioning runtime, but completely wrong during initial
+  bootstrap.  Provisioning is a one-time privileged operation that runs
+  before the license/key policy regime is fully established.  At
+  provisioning time, the license was just uploaded moments before and its
+  signature verification may fail (per #27/#28), causing rotate_keys() to
+  silently return without generating any Kyber keys.  build_trust_anchor()
+  then fails because has_kyber is False.  Generating keys directly
+  bypasses the license gate entirely, which is the correct behavior during
+  bootstrap.
+
 37. provision_device.py self_destruct zeroes self._vendor_dil_priv by
 creating a bytearray copy and zeroing that. The original bytes object is
 immutable and remains in memory. vb = bytearray(self._vendor_dil_priv)
@@ -776,6 +893,30 @@ self._installer_priv. The secure zeroization is theater — the actual
 key material persists in Python’s memory until garbage collected, and
 even then may persist in the heap.
 
+FIX APPLIED (provision_device.py — _load_installer_private_key, generate_keys,
+self_destruct):
+  - _load_installer_private_key() now stores the key as bytearray:
+      self._installer_priv = bytearray(self._installer_key_path.read_bytes())
+    instead of raw bytes.
+  - generate_keys() now stores vendor_dil_priv as bytearray:
+      self._vendor_dil_priv = bytearray(vendor_priv)
+  - The class field _vendor_dil_priv is initialized as bytearray() instead
+    of b"".
+  - self_destruct() now calls pqc_crypto.secure_zero() on the actual
+    bytearray objects in-place (after an isinstance check), then sets them
+    to None/bytearray().
+  WHY: Python bytes objects are immutable — you cannot overwrite their
+  contents.  The old code did `ba = bytearray(self._installer_priv)` which
+  created a NEW mutable copy, zeroed that copy, and left the original
+  bytes object untouched in the heap.  The "secure zeroization" was
+  security theater.  By storing keys as bytearray from the start, we
+  ensure the actual key material buffer is the one being zeroed.  This is
+  a best-effort approach — CPython’s memory allocator may still retain
+  freed pages, and the GC may have copied objects during compaction.
+  True guaranteed zeroization requires OS-level mlock/madvise or a C
+  extension, but storing as bytearray and zeroing in-place is the correct
+  approach within Python’s memory model.
+
 38. provision_device.py build_trust_anchor checks has_kyber =
 any("kyber_priv" in p for p in present_keys). But if generate_keys
 failed silently per #36, no Kyber files exist in the keys directory.
@@ -783,6 +924,33 @@ has_kyber is False. The method raises ProvisionError — but only after
 .sentinelrc, identity.json, and the license have already been written to
 disk. The system is in a half-provisioned state with no rollback
 mechanism.
+
+FIX APPLIED (provision_device.py provision method):
+  - The provision() method now wraps steps 1-5 (build_sentinelrc through
+    build_trust_anchor) in a try/except block that tracks all files written
+    during provisioning in a `written_files` list.
+  - On any exception, _rollback_provisioned_files(written_files) is called
+    before re-raising, which iterates through the list in reverse order
+    and unlinks each file.
+  - A new helper method _rollback_provisioned_files() was added to handle
+    the cleanup, with individual try/except per file so a single unlink
+    failure doesn’t prevent other files from being cleaned up.
+  - The locking step (provisioning_complete.flag) deliberately stays
+    OUTSIDE the try/except — it only runs after all critical files are
+    successfully written and verified, so there’s no risk of locking a
+    half-provisioned state.
+  - Additionally, fix #36 (generating Kyber keys directly) ensures
+    build_trust_anchor() won’t fail due to missing Kyber keys in the
+    first place — this rollback mechanism is a defense-in-depth safeguard.
+  WHY: The original code wrote files sequentially with no transaction
+  semantics.  If step 5 (build_trust_anchor) failed, steps 1-4 had
+  already written .sentinelrc, identity.json, license.key, and vendor keys
+  to disk.  The system was left in a half-provisioned state: not locked
+  (no flag file), but with partial artifacts that could confuse or block
+  subsequent provisioning attempts.  The rollback mechanism ensures
+  atomic-or-nothing provisioning: either everything succeeds and the flag
+  is set, or everything is cleaned up and the system remains in a
+  pristine pre-provisioning state.
 
 39. pqc_crypto.py encrypt_file_payload calls
 oqs.KeyEncapsulation("Kyber512", kyber_pub) and then
@@ -793,6 +961,25 @@ key. Passing the public key to the constructor likely causes either
 silent corruption or an error depending on the oqs wrapper version. The
 encryption pathway may be fundamentally broken at the liboqs API level.
 
+FIX APPLIED (pqc_crypto.py encrypt_file_payload, line ~131):
+  - Changed:
+      oqs.KeyEncapsulation("Kyber512", kyber_pub)
+    to:
+      oqs.KeyEncapsulation("Kyber512")
+  - The encap_secret(kyber_pub) call remains unchanged — it correctly
+    passes the public key to the encapsulation method.
+  WHY: The liboqs Python wrapper’s KeyEncapsulation constructor signature
+  is KeyEncapsulation(alg_name, secret_key=None).  The second parameter
+  is the SECRET key, used for decapsulation — not the public key.
+  Passing a public key as if it were a secret key caused either silent
+  corruption (the library might interpret arbitrary bytes as a secret key
+  structure) or an immediate error, depending on the oqs version and the
+  key length mismatch.  For encapsulation (encryption), no secret key is
+  needed — only the algorithm name.  The public key is correctly passed
+  to kem.encap_secret(kyber_pub), which generates the shared secret and
+  ciphertext.  This is now consistent with the decapsulation path (#40)
+  where the secret key IS correctly passed to the constructor.
+
 40. pqc_crypto.py decrypt_file_payload calls
 oqs.KeyEncapsulation("Kyber512", kyber_priv) and then
 kem.decap_secret(wrapped_kyber). Same API confusion — the
@@ -800,6 +987,25 @@ constructor’s second argument may be interpreted as a secret key for
 decapsulation, which would be correct here, but the inconsistency with
 #39 means encrypt and decrypt are using the constructor differently. If
 one works, the other likely doesn’t.
+
+FIX APPLIED (pqc_crypto.py decrypt_file_payload — documentation only):
+  - Added clarifying comments confirming the decapsulation constructor
+    call is CORRECT: KeyEncapsulation("Kyber512", kyber_priv) correctly
+    passes the secret key as the second argument, which liboqs uses for
+    decap_secret().
+  - No code change was needed for decapsulation — the inconsistency was
+    entirely in the encryption path (#39), where the PUBLIC key was
+    incorrectly passed where a SECRET key was expected.
+  WHY: The decapsulation path was always correct: the constructor’s second
+  argument IS the secret key, and kyber_priv IS the secret key.
+  decap_secret(wrapped_kyber) then uses that secret key to unwrap the
+  ciphertext and recover the shared secret.  The "inconsistency" noted
+  in the TODO was that encrypt and decrypt were using the constructor
+  differently — but after #39’s fix, they are now correctly different
+  for the right reasons: encrypt doesn’t need a secret key (just the
+  algorithm name), while decrypt does.  This asymmetry matches the
+  fundamental nature of KEM: encapsulation uses only the public key,
+  decapsulation uses only the secret key.
 
 41. pqc_crypto.py secure_zero is called on bytearray(dil_sig_bytes) in
 sign_content_bundle. Same immutability problem as #37. dil_sig_bytes is
