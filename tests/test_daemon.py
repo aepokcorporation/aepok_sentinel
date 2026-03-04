@@ -14,12 +14,11 @@ import shutil
 import unittest
 import tempfile
 import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, LicenseState
 from aepok_sentinel.core.audit_chain import AuditChain
-from aepok_sentinel.core.constants import EventCode
 from aepok_sentinel.core.security_daemon import SecurityDaemon
 
 

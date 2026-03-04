@@ -8,18 +8,15 @@ events on rollover all function correctly.
 import os
 import json
 import shutil
-import logging
 import tempfile
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from pathlib import Path
 
 from aepok_sentinel.core.logging_setup import (
     init_logging,
     get_logger,
     LoggingSetupError,
-    _LOGGING_INITIALIZED,
-    _FILE_HANDLER,
     _CONSOLE_HANDLER
 )
 

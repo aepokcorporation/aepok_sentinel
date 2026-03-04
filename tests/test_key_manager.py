@@ -15,14 +15,12 @@ import os
 import shutil
 import unittest
 import tempfile
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import LicenseManager, LicenseState
 from aepok_sentinel.core.key_manager import KeyManager, KeyManagerError
-from aepok_sentinel.core.key_manager_lock import KeyRotationLock
 from aepok_sentinel.core.audit_chain import AuditChain
-from aepok_sentinel.core.constants import EventCode
 
 
 class TestKeyManagerFinalShape(unittest.TestCase):

@@ -12,10 +12,10 @@ import json
 import unittest
 import tempfile
 import shutil
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from pathlib import Path
 
-from aepok_sentinel.core.config import load_config, ConfigError, SentinelConfig
+from aepok_sentinel.core.config import load_config, ConfigError
 
 
 class TestConfig(unittest.TestCase):

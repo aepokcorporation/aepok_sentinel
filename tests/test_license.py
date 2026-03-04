@@ -16,14 +16,13 @@ import json
 import shutil
 import unittest
 import tempfile
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from aepok_sentinel.core.config import SentinelConfig
 from aepok_sentinel.core.license import (
-    LicenseManager, LicenseError, is_watch_only, is_license_valid
+    LicenseManager, is_watch_only, is_license_valid
 )
 from aepok_sentinel.core.audit_chain import AuditChain
-from aepok_sentinel.core.constants import EventCode
 from aepok_sentinel.core.directory_contract import resolve_path
 
 

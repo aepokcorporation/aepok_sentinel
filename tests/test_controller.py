@@ -19,7 +19,6 @@ import base64
 from unittest.mock import patch, MagicMock
 
 from aepok_sentinel.core.controller import SentinelController, ControllerError
-from aepok_sentinel.core.constants import EventCode
 
 
 class TestController(unittest.TestCase):

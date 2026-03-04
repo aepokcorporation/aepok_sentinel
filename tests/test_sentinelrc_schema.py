@@ -15,8 +15,6 @@ import unittest
 
 from aepok_sentinel.utils.sentinelrc_schema import (
     validate_sentinelrc,
-    DEFAULTS,
-    REQUIRED_FIELDS
 )
 
 
